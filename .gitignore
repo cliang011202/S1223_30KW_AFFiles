@@ -1,0 +1,30 @@
+# 生成数据
+*.npz
+*.png
+*.csv
+*.pdf
+*.txt
+
+# 文档生成产物（注意：这会同时屏蔽 CLAUDE.md / *.md 文档）
+wind_data_analysis.md
+CLAUDE.md
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+
+# CAD/Solidworks
+*.SLDPRT
+*.IGS
+*.swp
+
+# 构建产物
+build/
+dist/
+*.egg-info/

@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(where python:*)",
+      "Bash(conda activate:*)",
+      "Bash(python -c \"import numpy, pandas; print\\('ok'\\)\")",
+      "Bash(conda run:*)",
+      "Read(//c/ProgramData/Miniconda3/**)",
+      "Read(//c/Users/Administrator/anaconda3/**)",
+      "Read(//c/Users/Administrator/miniconda3/**)",
+      "Read(//e/CCBlade/**)",
+      "Read(//e/CCBlade/ccblade/**)",
+      "Bash(/e/anaconda3_envs/envs/blade_opt/python.exe:*)",
+      "Bash(/e/anaconda3/python.exe:*)",
+      "Bash(ls E:/CCBlade/test/S1223_30KW_AFFiles/*.dat)"
+    ]
+  }
+}
