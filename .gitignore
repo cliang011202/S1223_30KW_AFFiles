@@ -20,9 +20,6 @@ __pycache__/
 .idea/
 
 # CAD/Solidworks
-*.SLDPRT
-*.IGS
-*.swp
 
 # 构建产物
 build/

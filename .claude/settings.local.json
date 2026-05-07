@@ -12,7 +12,8 @@
       "Read(//e/CCBlade/ccblade/**)",
       "Bash(/e/anaconda3_envs/envs/blade_opt/python.exe:*)",
       "Bash(/e/anaconda3/python.exe:*)",
-      "Bash(ls E:/CCBlade/test/S1223_30KW_AFFiles/*.dat)"
+      "Bash(ls E:/CCBlade/test/S1223_30KW_AFFiles/*.dat)",
+      "PowerShell(git *)"
     ]
   }
 }
