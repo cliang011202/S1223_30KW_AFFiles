@@ -134,32 +134,62 @@ def airfoil_camber_thickness(x_af, y_af, n_interp=200):
 # 3. 截面生成
 # ================================================================
 
-def generate_ellipse(le_x_mm, te_x_mm, thickness_mm, twist_deg, r_m, n=100):
-    """生成椭圆截面点列 (物理 mm, 已扭转, 已定位 Z)。
+def naca_sym_thickness(x_norm, t_over_c):
+    """NACA 00xx 对称厚度分布 (归一化半厚度)。
 
-    椭圆长轴沿弦向 (X), 短轴沿厚度方向 (Y)。
-    椭圆从 LE (le_x_mm) 延伸到 TE (te_x_mm), 中心位于二者中点。
-    闭合曲线: 包含闭合重复点 (首=末)。
+    x_norm: [0, 1] 弦向位置
+    t_over_c: 最大厚度/弦长
+    返回: 半厚度 / 弦长
+
+    LE 半径 = 1.1019 * t_over_c² * chord (vs 椭圆 R = b²/a ≈ t²/(2c))
+    例如 t/c=0.20, c=400mm: R_NACA=17.6mm vs R_ell=8mm — NACA 的 LE 圆钝得多,
+    与翼型 LE 形态一致, 避免放样 LE 棱线。
+
+    a4=-0.0996 钝 TE: r=0.200 处 TE 全厚≈2mm (vs -0.1036 闭合→0mm);
+    结构桨柄段 TE 太尖锐会在脱模/搬运中崩裂。
+    """
+    a0, a1, a2, a3 = 0.2969, -0.1260, -0.3516, 0.2843
+    a4 = -0.0996  # 钝 TE: y(1.0)≈0.005 @ t/c=0.25 → TE 全厚≈2mm
+    x = np.maximum(np.asarray(x_norm), 0.0)
+    y = (t_over_c / 0.20) * (a0 * np.sqrt(x) + a1 * x + a2 * x**2 + a3 * x**3 + a4 * x**4)
+    return np.maximum(y, 0.0)
+
+
+def generate_ellipse(le_x_mm, te_x_mm, thickness_mm, twist_deg, r_m, n=100):
+    """生成 NACA 00xx 对称截面 (替代数学椭圆, 用于桨柄段)。
+
+    NACA 厚度分布提供与翼型一致的 LE 圆角半径 + 最大厚度 @ 30% 弦。
+    零弯度, 适合结构桨柄。闭合曲线: 包含闭合重复点 (首=末)。
     """
     width_mm = te_x_mm - le_x_mm
-    center_x = (le_x_mm + te_x_mm) / 2.0
-    a = width_mm / 2.0       # 弦向半轴
-    b = thickness_mm / 2.0   # 厚度半轴
+    t_over_c = thickness_mm / width_mm
     th = TWIST_SIGN * math.radians(twist_deg)
-    c, s = math.cos(th), math.sin(th)
+    c_th_val, s_th_val = math.cos(th), math.sin(th)
 
-    pts = []
-    for i in range(n):
-        theta = 2.0 * math.pi * i / n
-        x_local = center_x + a * math.cos(theta)
-        y_local = b * math.sin(theta)
-        # 扭转
-        X = x_local * c - y_local * s
-        Y = x_local * s + y_local * c
+    # 弦向采样: cos-spaced, LE/TE 密 → 中部疏
+    n_half = n // 2
+    theta_vals = np.linspace(0.0, math.pi, n_half + 1)
+    t_vals = (1.0 - np.cos(theta_vals)) / 2.0        # [0, 1]
+    y_half = naca_sym_thickness(t_vals, t_over_c) * width_mm  # 半厚度 (mm)
+
+    upper, lower = [], []
+    for i in range(len(t_vals)):
+        x_phys = le_x_mm + t_vals[i] * width_mm
+        y = y_half[i]
+        X_up = x_phys * c_th_val - y * s_th_val
+        Y_up = x_phys * s_th_val + y * c_th_val
         Z = r_m * 1000.0
-        pts.append((X, Y, Z))
+        upper.append((X_up, Y_up, Z))
 
-    # 闭合
+    for i in range(len(t_vals) - 1, -1, -1):
+        x_phys = le_x_mm + t_vals[i] * width_mm
+        y = -y_half[i]
+        X_lo = x_phys * c_th_val - y * s_th_val
+        Y_lo = x_phys * s_th_val + y * c_th_val
+        Z = r_m * 1000.0
+        lower.append((X_lo, Y_lo, Z))
+
+    pts = upper[:-1] + lower
     pts.append(pts[0])
     return pts
 
@@ -167,68 +197,61 @@ def generate_ellipse(le_x_mm, te_x_mm, thickness_mm, twist_deg, r_m, n=100):
 def generate_blend(le_x_mm, te_x_mm, thickness_mm, twist_deg, r_m,
                    du_x_norm, du_camber, du_thickness,
                    blend_factor=0.455, n=100):
-    """生成椭圆→DU 翼型的过渡截面 (物理 mm, 已扭转 + 定位)。
+    """生成 NACA 对称 → DU 翼型的过渡截面 (物理 mm, 已扭转 + 定位)。
 
-    截面从 le_x_mm (LE) 到 te_x_mm (TE), 跨距即当前站的弦向宽度。
     方法: camber+thickness 分解后线性混合。
       - camber_blend(x)   = blend_factor * DU_camber(x_norm)
-      - thickness_blend(x) = (1-blend_factor) * ellipse_thickness(x)
+      - thickness_blend(x) = (1-blend_factor) * naca_thickness(x_norm)
                            + blend_factor * DU_thickness(x_norm) * scale
 
     参数:
-      blend_factor: 0 = 纯椭圆, 1 = 纯 DU。
+      blend_factor: 0 = 纯 NACA 对称, 1 = 纯 DU。
     """
     width_mm = te_x_mm - le_x_mm
-    center_x = (le_x_mm + te_x_mm) / 2.0
-    a = width_mm / 2.0
-    b = thickness_mm / 2.0
+    t_over_c = thickness_mm / width_mm
     th = TWIST_SIGN * math.radians(twist_deg)
-    c_th, s_th = math.cos(th), math.sin(th)
+    c_th_val, s_th_val = math.cos(th), math.sin(th)
 
-    # 弦向采样: 在 [le_x, te_x] 上 cos-spaced
+    # 弦向采样: cos-spaced
     n_half = n // 2
-    # 归一化采样 t ∈ [0, 1], cos-spaced
     theta_vals = np.linspace(0.0, math.pi, n_half + 1)
-    t_vals = (1.0 - np.cos(theta_vals)) / 2.0  # cos spacing in [0, 1]
-    x_phys = le_x_mm + t_vals * width_mm        # physical x from LE to TE
-    x_norm = t_vals                              # normalized to [0, 1]
+    t_vals = (1.0 - np.cos(theta_vals)) / 2.0
+    x_phys = le_x_mm + t_vals * width_mm
+    x_norm = t_vals
 
-    # ---- 椭圆 thickness (相对中心 center_x) ----
-    ell_thickness = np.zeros_like(x_phys)
-    mask = np.abs(x_phys - center_x) < a * 0.9999
-    ell_thickness[mask] = 2.0 * b * np.sqrt(np.maximum(0.0, 1.0 - ((x_phys[mask] - center_x) / a) ** 2))
+    # ---- NACA 对称厚度 ----
+    naca_half = naca_sym_thickness(x_norm, t_over_c)
+    naca_thick = 2.0 * naca_half * width_mm  # 物理全厚度
 
-    # ---- DU camber + thickness (插值到 x_norm) ----
+    # ---- DU camber + thickness ----
     du_c = np.interp(x_norm, du_x_norm, du_camber)
     du_t = np.interp(x_norm, du_x_norm, du_thickness)
 
-    # DU max thickness (归一化) → 缩放到 blend 物理厚度
     du_t_max = float(np.max(du_thickness)) if len(du_thickness) > 0 else 0.198
     du_t_scale = thickness_mm / (du_t_max * width_mm + 1e-12)
     du_t_phys = du_t * width_mm * du_t_scale
 
     # ---- 混合 ----
-    blend_t = (1.0 - blend_factor) * ell_thickness + blend_factor * du_t_phys
-    blend_c = blend_factor * du_c * width_mm  # camber 从 0 按 blend_factor 生长
+    blend_t = (1.0 - blend_factor) * naca_thick + blend_factor * du_t_phys
+    blend_c = blend_factor * du_c * width_mm
 
-    # ---- 组装上下表面 → 闭合曲线 ----
-    upper = []
+    # ---- 组装 ----
+    upper, lower = [], []
     for i in range(len(x_phys)):
         y = blend_c[i] + blend_t[i] / 2.0
         x = x_phys[i]
-        X = x * c_th - y * s_th
-        Y = x * s_th + y * c_th
+        X_u = x * c_th_val - y * s_th_val
+        Y_u = x * s_th_val + y * c_th_val
         Z = r_m * 1000.0
-        upper.append((X, Y, Z))
+        upper.append((X_u, Y_u, Z))
 
-    lower = []
     for i in range(len(x_phys) - 1, -1, -1):
         y = blend_c[i] - blend_t[i] / 2.0
         x = x_phys[i]
-        X = x * c_th - y * s_th
-        Y = x * s_th + y * c_th
+        X_l = x * c_th_val - y * s_th_val
+        Y_l = x * s_th_val + y * c_th_val
         Z = r_m * 1000.0
-        lower.append((X, Y, Z))
+        lower.append((X_l, Y_l, Z))
 
     pts = upper[:-1] + lower
     return pts

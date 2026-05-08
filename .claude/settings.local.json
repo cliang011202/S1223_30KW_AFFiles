@@ -13,7 +13,9 @@
       "Bash(/e/anaconda3_envs/envs/blade_opt/python.exe:*)",
       "Bash(/e/anaconda3/python.exe:*)",
       "Bash(ls E:/CCBlade/test/S1223_30KW_AFFiles/*.dat)",
-      "PowerShell(git *)"
+      "PowerShell(git *)",
+      "Bash(Remove-Item cad_sections/hub_body_section_z*.sldcrv -ErrorAction SilentlyContinue)",
+      "Bash(Remove-Item cad_sections/hub_profile_*.sldcrv -ErrorAction SilentlyContinue)"
     ]
   }
 }
