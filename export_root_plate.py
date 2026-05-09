@@ -1,29 +1,39 @@
 """
 export_root_plate.py
 ========================================================
-交叉夹板式架构 — Blade 1 根部平板延伸截面
+交叉夹板式架构 — Blade 1 根部平板延伸截面 (含 z<0 反向 tab)
 
-从 r=0 (中心平板, 叠放夹持) 到 r=0.200 (对接 Domain A NACA 桨柄),
-生成超椭圆过渡截面 → .sldcrv, 用于 SolidWorks 放样。
+从 z=-Z_TAB (反向 tab 起点) 到 z=+0.200 (对接 Domain A NACA 桨柄),
+生成 7 站截面 → .sldcrv, 用于 SolidWorks 放样。
 
-输出:
-  - cad_sections/root_section_r0.000_blade1.sldcrv  (中心平板, 超椭圆 n=4)
-  - cad_sections/root_section_r0.050_blade1.sldcrv  (超椭圆 n=3)
-  - cad_sections/root_section_r0.100_blade1.sldcrv  (超椭圆 n=2.5)
-  - cad_sections/root_section_r0.150_blade1.sldcrv  (超椭圆 n=2, 纯椭圆)
-  - cad_sections/root_section_r0.200_blade1.sldcrv  (NACA 00xx, 对接 shank)
+几何分两段:
+  • 交叉 tab 区 z∈[-Z_TAB, +Z_TAB] (3 站): 恒定 262×25, Y_off=+12.5, n=4
+    → 两叶在此区域 Y 方向并排重叠 (Blade1 上 [0,+25], Blade2 下 [-25,0]),
+       螺栓 (Z=0 一行) 贯穿两叶+夹板, 无空气间隙, 离心力压实传递
+  • 过渡区 z∈[+Z_TAB, +0.200] (4 站): 等宽 262mm, 厚 25→50, Y_off 12.5→0, n 4→NACA
+    → 在 150mm 内完成由平板到 NACA 桨柄截面的过渡, 已脱出夹板覆盖区
+
+输出 (7 个截面 .sldcrv):
+  - cad_sections/root_section_r-0.050_blade1.sldcrv   (tab 起点)
+  - cad_sections/root_section_r0.000_blade1.sldcrv    (螺栓中心)
+  - cad_sections/root_section_r0.050_blade1.sldcrv    (tab 终点)
+  - cad_sections/root_section_r0.087_blade1.sldcrv    (过渡 n=3)
+  - cad_sections/root_section_r0.125_blade1.sldcrv    (过渡 n=2.5)
+  - cad_sections/root_section_r0.162_blade1.sldcrv    (过渡 n=2)
+  - cad_sections/root_section_r0.200_blade1.sldcrv    (NACA 00xx, 对接 shank)
   - cad_sections/_root_summary.txt
   - cad_sections/_root_preview.png
 
 坐标系 (与 blade/shank 一致):
   - 原点 = 转轴中心
-  - Z = 叶展 (blade 1 沿 +Z)
-  - X = 弦向, Y = 厚度方向
+  - Z = 叶展 (Blade1 沿 +Z, tab 反向延伸至 -Z)
+  - X = 弦向, Y = 厚度方向 (旋转轴方向, 同时也是夹板法向)
   - 截面平面: X-Y @ Z=r
 
 关联:
-  - r=0.200 截面 = 现有 shank_section_r0.200_ellipse.sldcrv (NACA)
-  - r=0 平板与 Blade 2 根板在 Y 方向叠放 (Blade1 偏 +Y, Blade2 偏 -Y)
+  - r=0.200 截面 = Domain A shank_section_r0.200.sldcrv (NACA, 完全一致)
+  - Blade2 = Blade1 绕 X 轴旋转 180° (Y 翻转 + Z 翻转)
+    → Blade2 跨 z∈[-200, +Z_TAB], 与 Blade1 在 z∈[-Z_TAB, +Z_TAB] 区域交叉
 ========================================================
 """
 
@@ -40,13 +50,21 @@ WORK_DIR = r"E:\CCBlade\test\S1223_30KW_AFFiles"
 OUT_DIR  = os.path.join(WORK_DIR, "cad_sections")
 
 # ---- 根部平板 (r=0) ----
-PLATE_WIDTH     = 120.0     # mm, X 方向宽度
-PLATE_THICK     = 15.0      # mm, Y 方向厚度
-PLATE_Y_OFFSET  = 8.0       # mm, Blade1 根板 Y 偏移 (Blade2 取负)
+PLATE_WIDTH     = 262.0     # mm, X 方向宽度 (≥ 电机法兰 PCD 240mm 包络)
+PLATE_THICK     = 25.0      # mm, Y 方向厚度
+PLATE_Y_OFFSET  = 12.5      # mm, Blade1 根板 Y 偏移 (Blade2 取负)
+                             # = PLATE_THICK/2 → Blade1 跨 [0, +25], Blade2 跨 [-25, 0],
+                             # 两叶根在 Y=0 平面直接贴合, 离心力直接压实传递
+
+# ---- 交叉 tab (z<0 反向延伸, 用于贯穿夹紧螺栓) ----
+Z_TAB           = 50.0      # mm, tab 单边 z 方向延伸长度
+                             # Blade1 实际 z 跨度 = [-Z_TAB, +200],
+                             # 在 z∈[-Z_TAB, +Z_TAB] 区域两叶恒截面 120×15 重叠,
+                             # → 螺栓贯穿无空气, 夹板有效压紧
 
 # ---- 对接面 (r=0.200) ----
 SHANK_R         = 0.200     # m
-SHANK_WIDTH     = 200.0     # mm  (LE=-100, TE=+100)
+SHANK_WIDTH     = 262.0     # mm  (LE=-131, TE=+131)
 SHANK_THICK     = 50.0      # mm
 
 # ---- 过渡站 ----
@@ -55,16 +73,24 @@ SHANK_THICK     = 50.0      # mm
 # r=0.200 为 NACA 00xx, 与 Domain A shank r=0.200 截面完全一致 → 根板放样终点 = 桨柄放样起点
 # n_exp: superellipse 形状控制 (2=椭圆, 4=圆角矩形), naca_sym 此项为 None
 ROOT_STATIONS = [
-    (0.000, "superellipse", 120.0, 15.0,  8.0, 4),     # n=4 圆角, 降应力集中
-    (0.050, "superellipse", 140.0, 23.8,  6.0, 3),
-    (0.100, "superellipse", 160.0, 32.5,  4.0, 2.5),
-    (0.150, "superellipse", 180.0, 41.2,  2.0, 2),     # n=2 纯椭圆, 最接近 NACA
-    (0.200, "naca_sym",     200.0, 50.0,  0.0, None),  # 对接 Domain A shank, 截面形状一致
+    # ── 交叉夹板 tab 区 (恒定 262×25, Y_off=+12.5, n=4): z∈[-Z_TAB, +Z_TAB] ──
+    # 这一段两片叶根恒截面重叠, Blade1 占 Y∈[0,+25], Blade2 占 Y∈[-25,0],
+    # 螺栓 (Z=0 一行 4 颗) 贯穿两叶 + 前后夹板, 无空气间隙
+    (-0.050, "superellipse", 262.0, 25.0,  12.500, 4),    # tab 起点 (反向延伸至 z=-50)
+    ( 0.000, "superellipse", 262.0, 25.0,  12.500, 4),    # 螺栓孔中心平面
+    ( 0.050, "superellipse", 262.0, 25.0,  12.500, 4),    # tab 终点, 过渡起点
+    # ── 过渡区 (等宽 262mm, 厚 25→50 线性, Y_off 12.5→0 线性, 长 150mm): z∈[+Z_TAB, +200] ──
+    ( 0.0875, "superellipse", 262.0, 31.25,  9.375, 3),   # frac=0.25
+    ( 0.125,  "superellipse", 262.0, 37.50,  6.250, 2.5), # frac=0.50
+    ( 0.1625, "superellipse", 262.0, 43.75,  3.125, 2),   # frac=0.75, n=2 纯椭圆
+    ( 0.200,  "naca_sym",     262.0, 50.0,   0.000, None),# 对接 Domain A shank, 截面形状一致
 ]
 
 # ---- 输出参数 ----
 RESAMPLE_N      = 100
 LOOP_DIRECTION  = "cw"
+ALIGN_START     = "principal-pos"   # 起点对齐到主轴正方向 (= TE 端), 与 shank/blade 脚本一致
+                                     # → 7 个 root 截面起点统一; r=0.200 root 与 shank 起点对齐
 CLOSE_CURVE     = True
 DEDUP_TOL_MM    = 1e-3
 
@@ -152,6 +178,54 @@ def dedup_consecutive(pts, tol):
             continue
         out.append(p)
     return out
+
+
+def section_centroid(pts):
+    cx = sum(p[0] for p in pts) / len(pts)
+    cy = sum(p[1] for p in pts) / len(pts)
+    return cx, cy
+
+
+def principal_axis(pts):
+    """惯性主轴方向 (X-Y 投影). 对于细长截面, 主轴 ≈ 弦向."""
+    cx, cy = section_centroid(pts)
+    sxx = syy = sxy = 0.0
+    for x, y, _ in pts:
+        dx, dy = x - cx, y - cy
+        sxx += dx * dx; syy += dy * dy; sxy += dx * dy
+    n = len(pts)
+    sxx /= n; syy /= n; sxy /= n
+    tr = sxx + syy
+    det = sxx * syy - sxy * sxy
+    disc = max(0.0, tr * tr / 4.0 - det)
+    lam1 = tr / 2.0 + math.sqrt(disc)
+    if abs(sxy) > 1e-18:
+        ux, uy = lam1 - syy, sxy
+    else:
+        ux, uy = (1.0, 0.0) if sxx >= syy else (0.0, 1.0)
+    norm = math.hypot(ux, uy) or 1.0
+    return (ux / norm, uy / norm)
+
+
+def cyclic_shift_to_start(pts, mode, axis=None):
+    """循环移位曲线起点. 与 shank/blade 脚本同步:
+       'principal-pos' = 起点移到沿主轴 +方向投影最大的点 (≈ TE 端).
+    """
+    if not pts or mode == "none":
+        return pts
+    if mode in ("principal-pos", "principal-neg"):
+        cx, cy = section_centroid(pts)
+        ux, uy = axis if axis is not None else (1.0, 0.0)
+        sign = 1.0 if mode == "principal-pos" else -1.0
+        idx = max(range(len(pts)),
+                  key=lambda i: sign * ((pts[i][0] - cx) * ux + (pts[i][1] - cy) * uy))
+    elif mode == "max-x":
+        idx = max(range(len(pts)), key=lambda i: pts[i][0])
+    elif mode == "min-x":
+        idx = min(range(len(pts)), key=lambda i: pts[i][0])
+    else:
+        return pts
+    return pts[idx:] + pts[:idx]
 
 
 def enforce_direction(pts, sense):
@@ -265,10 +339,10 @@ def main():
     os.makedirs(OUT_DIR, exist_ok=True)
 
     print("=" * 90)
-    print("  Blade 1 Root Plate Extension — 交叉夹板式根部平板延伸截面")
-    print(f"  r=0 平板: {PLATE_WIDTH:.0f}x{PLATE_THICK:.0f}mm, Y偏移 +{PLATE_Y_OFFSET:.0f}mm")
-    print(f"  r={SHANK_R:.3f} 对接: NACA 00xx, {SHANK_WIDTH:.0f}x{SHANK_THICK:.0f}mm")
-    print(f"  过渡: 超椭圆(n=4→2) + NACA @ r=0.200")
+    print("  Blade 1 Root Plate Extension — 交叉夹板式根部平板 (含反向 tab)")
+    print(f"  Tab 区 z∈[-{Z_TAB:.0f}, +{Z_TAB:.0f}]: 恒 {PLATE_WIDTH:.0f}x{PLATE_THICK:.0f}mm, Y偏移 +{PLATE_Y_OFFSET:.1f}mm")
+    print(f"  过渡区 z∈[+{Z_TAB:.0f}, +{SHANK_R*1000:.0f}]: 等宽 {PLATE_WIDTH:.0f}mm, 厚 {PLATE_THICK:.0f}→{SHANK_THICK:.0f}mm (长 {SHANK_R*1000-Z_TAB:.0f}mm)")
+    print(f"  形状插值: 超椭圆 n=4→3→2.5→2 → NACA 00xx")
     print("=" * 90)
     print(f"  {'r [m]':>7}  {'type':<14}  {'width':>7}  {'thick':>7}  {'Y-off':>7}  {'n':>5}  {'N_in→out':>10}  file")
     print("-" * 90)
@@ -290,10 +364,14 @@ def main():
         pts_3d = [(x, y, r_m * 1000.0) for (x, y) in pts_2d]
         n_raw = len(pts_3d)
 
-        # Pipeline
+        # Pipeline (与 shank/blade 脚本同步)
         pts_dd = dedup_consecutive(pts_3d, DEDUP_TOL_MM)
         pts_dir = enforce_direction(pts_dd, LOOP_DIRECTION)
-        pts_resampled = resample_arclength_closed(pts_dir, RESAMPLE_N)
+        # 起点对齐到主轴 +方向 (≈TE 端) → 7 站起点统一,
+        # 且 r=0.200 root 截面与 shank 第一站 (r=0.200 ellipse) 起点完全一致
+        axis = principal_axis(pts_dir)
+        pts_aligned = cyclic_shift_to_start(pts_dir, ALIGN_START, axis=axis)
+        pts_resampled = resample_arclength_closed(pts_aligned, RESAMPLE_N)
         if CLOSE_CURVE and (pts_resampled[0] != pts_resampled[-1]):
             pts_final = pts_resampled + [pts_resampled[0]]
         else:
@@ -316,9 +394,10 @@ def main():
     with open(summary_path, "w", encoding="utf-8", newline="") as fh:
         fh.write("# Blade 1 Root Plate Extension 汇总\n")
         fh.write(f"# 架构: 交叉夹板式 — 根板延伸穿过毂体中心\n")
-        fh.write(f"# r=0 平板: {PLATE_WIDTH:.0f}x{PLATE_THICK:.0f}mm, Y偏移 +{PLATE_Y_OFFSET:.0f}mm\n")
-        fh.write(f"# r={SHANK_R:.3f} 对接: NACA 00xx (与 Domain A shank 截面一致)\n")
-        fh.write(f"# Blade 2 根板: 取 Y 偏移为负 (镜像)\n")
+        fh.write(f"# Tab 区 z∈[-{Z_TAB:.0f}, +{Z_TAB:.0f}]: 恒 {PLATE_WIDTH:.0f}x{PLATE_THICK:.0f}mm, Y偏移 +{PLATE_Y_OFFSET:.2f}mm (= 半厚)\n")
+        fh.write(f"# 过渡区 z∈[+{Z_TAB:.0f}, +{SHANK_R*1000:.0f}]: 等宽 {PLATE_WIDTH:.0f}mm, 厚 {PLATE_THICK:.0f}→{SHANK_THICK:.0f}mm (Domain A shank 起点)\n")
+        fh.write(f"# Blade 2: Blade 1 绕 X 轴旋转 180°, 跨 z∈[-200, +{Z_TAB:.0f}]\n")
+        fh.write(f"# 交叉重叠区 z∈[-{Z_TAB:.0f}, +{Z_TAB:.0f}]: 两叶恒截面并排 (Blade1 上 Blade2 下), 螺栓贯穿两叶\n")
         fh.write(f"# unit: mm | newline: CRLF | sep: TAB\n#\n")
         fh.write(f"# {'r[m]':>7}  {'type':<14}  {'W[mm]':>7}  {'T[mm]':>7}  {'Yoff[mm]':>8}  {'n':>5}  file\n")
         for row in summary_rows:
@@ -332,15 +411,17 @@ def main():
 
     print(f"\n  完成: 写出 {n_written} 个根板截面 .sldcrv\n")
     print("  SolidWorks 操作:")
-    print("    1. 插入 5 个 root_section_r*.sldcrv (含 r=0.200 NACA)")
-    print("    2. 放样: r=0 → r=0.050 → r=0.100 → r=0.150 → r=0.200")
-    print("       - r=0.200 为 NACA 00xx, 与 Domain A shank 首站截面完全一致")
-    print("       - 根板放样终点 (r=0.200) = 桨柄放样起点 → 无接缝")
+    print(f"    1. 插入 7 个 root_section_r*.sldcrv (含反向 tab z=-{Z_TAB:.0f} 起点 + r=+0.200 NACA 终点)")
+    print(f"    2. 放样: z=-{Z_TAB:.0f} → 0 → +{Z_TAB:.0f} → +87.5 → +125 → +162.5 → +200")
+    print(f"       - tab 段 (z∈[-{Z_TAB:.0f}, +{Z_TAB:.0f}]) 三站全等 → 恒截面棱柱")
+    print(f"       - 过渡段 (z∈[+{Z_TAB:.0f}, +200]) 4 站递进 → 平滑 NACA 过渡")
     print("       - 起始/终止约束 = '无'")
-    print("    3. Blade 2 根板: Mirror Body 关于 X-Z 平面 (Y 翻转)")
-    print("       - 或旋转 180° 关于 Y 轴, 视叶片相对方位确定")
-    print("    4. 根板在 r=0 处有 4×M12 螺栓通孔 (在 hub 脚本中定位)")
-    print("    5. 合并: Root (r=0→0.200) + Shank (r=0.200→0.676) + Aero (r=0.676→3.498) → Single Body (Blade 1)\n")
+    print("    3. Blade 2 根板: 绕 X 轴旋转 Blade 1 整体 180°")
+    print(f"       - 旋转后 Blade 2 跨 z∈[-200, +{Z_TAB:.0f}], 与 Blade 1 在 z∈[-{Z_TAB:.0f}, +{Z_TAB:.0f}] 交叉重叠")
+    print("       - Blade 1 占 Y∈[0, +25], Blade 2 占 Y∈[-25, 0], 在 Y=0 面贴合")
+    print("    4. 螺栓孔: hub 脚本输出 4 颗 M12 在 Z=0 一行, 全部位于交叉 tab 区内")
+    print("    5. 合并: Root (z=-50→+200) + Shank (z=200→676) + Aero (z=676→3498) → Single Body")
+    print(f"       注意: Domain A shank 起点 = z=200, 与本脚本终点 (NACA {SHANK_WIDTH:.0f}×{SHANK_THICK:.0f}) 完全衔接\n")
 
 
 if __name__ == "__main__":

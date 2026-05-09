@@ -15,7 +15,18 @@
       "Bash(ls E:/CCBlade/test/S1223_30KW_AFFiles/*.dat)",
       "PowerShell(git *)",
       "Bash(Remove-Item cad_sections/hub_body_section_z*.sldcrv -ErrorAction SilentlyContinue)",
-      "Bash(Remove-Item cad_sections/hub_profile_*.sldcrv -ErrorAction SilentlyContinue)"
+      "Bash(Remove-Item cad_sections/hub_profile_*.sldcrv -ErrorAction SilentlyContinue)",
+      "Bash(awk 'NR<=3 || NR%30==0 {print FILENAME\":\",$0}' cad_sections/hub_clamp_plate_front.sldcrv cad_sections/hub_clamp_plate_rear.sldcrv)",
+      "Bash(awk 'NR<=2 {print FILENAME\":\",$0}' cad_sections/root_section_r0.000_blade1.sldcrv cad_sections/root_section_r0.050_blade1.sldcrv cad_sections/root_section_r0.150_blade1.sldcrv cad_sections/root_section_r0.200_blade1.sldcrv)",
+      "Bash(awk '{print $2}' cad_sections/root_section_r0.000_blade1.sldcrv)",
+      "Bash(awk 'NR==1; END{print}')",
+      "Bash(awk '{print $2}' cad_sections/root_section_r-0.050_blade1.sldcrv)",
+      "Bash(awk '{print $3}' cad_sections/root_section_r-0.050_blade1.sldcrv)",
+      "Bash(awk 'BEGIN{minx=99;maxx=-99} {if\\($1<minx\\)minx=$1; if\\($1>maxx\\)maxx=$1} END{print \"X range:\", minx, \"to\", maxx}' cad_sections/hub_clamp_bolt_1.sldcrv)",
+      "PowerShell(/e/anaconda3/python.exe export_root_plate.py)",
+      "PowerShell(E:\\\\anaconda3\\\\python.exe export_root_plate.py)",
+      "PowerShell(E:\\\\anaconda3\\\\python.exe export_shank_sections.py)",
+      "PowerShell(E:\\\\anaconda3\\\\python.exe export_hub_geometry.py)"
     ]
   }
 }
