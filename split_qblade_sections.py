@@ -16,7 +16,7 @@ Each output file is tab-separated x y z, ready for SolidWorks
 
 Usage:
     python split_qblade_sections.py <input.txt> [--unit mm|m] [--drop-last-duplicate]
-    python split_qblade_sections.py <input.txt> --resample 80 --keep-last-duplicate
+    python split_qblade_sections.py <input.txt> --resample 80 --keep-last-duplicate(目前是)
 """
 
 import argparse
@@ -95,6 +95,39 @@ def dedup_consecutive(pts, tol_m: float = 1e-7):
             continue
         out.append(p)
     return out, removed
+
+
+def remove_double_trace(pts, tol_m: float = 1e-6):
+    """
+    If the open polyline loops back to start and then traces the same
+    profile a second time (QBlade double-export), keep only the first
+    traversal.  Returns (trimmed_pts, was_double).
+    """
+    if len(pts) < 4:
+        return list(pts), False
+    x0, y0, z0 = pts[0]
+    cum = 0.0
+    for i in range(1, len(pts)):
+        dx = pts[i][0] - pts[i - 1][0]
+        dy = pts[i][1] - pts[i - 1][1]
+        dz = pts[i][2] - pts[i - 1][2]
+        cum += (dx * dx + dy * dy + dz * dz) ** 0.5
+    total = cum
+    if total <= 0:
+        return list(pts), False
+
+    cum = 0.0
+    for i in range(1, len(pts)):
+        dx = pts[i][0] - pts[i - 1][0]
+        dy = pts[i][1] - pts[i - 1][1]
+        dz = pts[i][2] - pts[i - 1][2]
+        cum += (dx * dx + dy * dy + dz * dz) ** 0.5
+        if cum < 0.25 * total:
+            continue
+        d2_start = (pts[i][0] - x0) ** 2 + (pts[i][1] - y0) ** 2 + (pts[i][2] - z0) ** 2
+        if d2_start < tol_m * tol_m:
+            return pts[:i + 1], True
+    return list(pts), False
 
 
 def resample_arclength(pts, n: int):
@@ -364,6 +397,7 @@ def main():
     prepared = []
     dedup_counts = []
     was_closed = []
+    double_trace_removed = []
     for raw_pts in sections:
         is_closed = (
             len(raw_pts) >= 2
@@ -375,6 +409,8 @@ def main():
         pts = drop_closing_duplicate(raw_pts)  # always strip for clean processing
         pts, removed = dedup_consecutive(pts, tol_m=dedup_tol_m)
         dedup_counts.append(removed)
+        pts, was_double = remove_double_trace(pts)
+        double_trace_removed.append(was_double)
         if args.direction != "none":
             pts = enforce_direction(pts, args.direction)
         prepared.append(pts)
@@ -417,6 +453,8 @@ def main():
             flags.append("cyl-borrow")
         if dedup_counts[i - 1]:
             flags.append(f"dedup={dedup_counts[i-1]}")
+        if double_trace_removed[i - 1]:
+            flags.append("half-trace-kept")
         flag_str = " (" + ", ".join(flags) + ")" if flags else ""
         print(
             f"  sec{i:0{width}d}  z={z_mean*scale:9.2f} {args.unit}  "

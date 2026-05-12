@@ -32,7 +32,10 @@
       "Bash(E:/anaconda3/python.exe *)",
       "Read(//e/anaconda3/**)",
       "Bash(\"E:/anaconda3/Scripts/conda.exe\" info *)",
-      "Bash(E:/anaconda3_envs/envs/blade_opt/python.exe *)"
+      "Bash(E:/anaconda3_envs/envs/blade_opt/python.exe *)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:docs.qblade.org)"
     ]
   }
 }

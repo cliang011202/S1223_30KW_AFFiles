@@ -35,6 +35,7 @@ import os
 import sys
 import math
 import numpy as np
+from scipy.interpolate import PchipInterpolator
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -57,9 +58,9 @@ _r_array  = np.array([0.202, 0.350, 0.676, 0.967, 1.135,
 _chord_array = np.array([0.2500, 0.2500, 0.6000, 0.5192, 0.4681,
                           0.3500, 0.3200, 0.2896, 0.2536, 0.2224,
                           0.1954, 0.1741, 0.1331, 0.1182])
-_twist_array = np.array([18.20, 18.20, 16.96, 11.07,  8.75,
-                            5.37,  4.11,  3.06,  3.18,  2.46,
-                            1.84,  1.34,  0.25, -0.58])
+_twist_array = np.array([18.20, 18.20, 18.20, 10.38,  7.54,
+                          4.29,  3.46,  2.97,  2.72,  2.60,
+                          2.56,  2.56,  2.45,  1.68])
 
 # idx → 翼型文件名 (无 .dat 扩展)。None = 不导出 (圆柱段)
 AIRFOIL_MAP = {
@@ -76,6 +77,10 @@ ALIGN_START     = "principal-pos"  # 起点对齐: principal-pos = TE 端 (PCA �
 LOOP_DIRECTION  = "cw"        # 强制方向: "cw" / "ccw" (从 +Z 看)
 CLOSE_CURVE     = True        # 末点 = 首点 → 闭合曲线 (SW 放样 + 填充必需)
 DEDUP_TOL_MM    = 1e-3        # 相邻点距阈值 (mm), 删除小于此值的重复点
+
+# ---- 展向曲面参数 (重建 QBlade 的内部 3D 叶片曲面) ----
+N_AF_POINTS     = 160         # 翼型归一化点数 (所有翼型重采样到此数, 保证弦向参数一致)
+SPANWISE_SMOOTH = 0.0         # 展向光滑因子 (PchipInterpolator 保证 C1 连续; >0 时改为 UnivariateSpline 光滑)
 
 GENERATE_PREVIEW = True       # 写一张 _preview.png 三视图供肉眼校核
 
@@ -295,6 +300,94 @@ def resample_arclength_closed(pts, n_unique):
     return out
 
 
+def normalize_airfoil_closed(x_af, y_af, n_pts):
+    """把单位翼型 (Selig 格式, 可能的闭合重复) 沿弧长均匀重采样到 n_pts 点。
+
+    所有翼型归一化到同一弦向参数化 → 同一索引在不同翼型间对应同一几何位置
+    (TE→上表面→LE→下表面→TE), 这是展向样条曲面必需的。
+    """
+    if n_pts < 4:
+        return x_af, y_af
+    pts = list(zip(x_af, y_af))
+    # 去除闭合重复
+    if len(pts) >= 2 and abs(pts[0][0] - pts[-1][0]) < 1e-9 and abs(pts[0][1] - pts[-1][1]) < 1e-9:
+        pts = pts[:-1]
+    m = len(pts)
+    # 弧长累积
+    cum = [0.0]
+    for i in range(1, m):
+        dx = pts[i][0] - pts[i - 1][0]
+        dy = pts[i][1] - pts[i - 1][1]
+        cum.append(cum[-1] + math.sqrt(dx * dx + dy * dy))
+    dx = pts[0][0] - pts[-1][0]
+    dy = pts[0][1] - pts[-1][1]
+    cum.append(cum[-1] + math.sqrt(dx * dx + dy * dy))
+    total = cum[-1]
+    if total <= 0:
+        return x_af, y_af
+
+    out_x, out_y = [], []
+    j = 0
+    for k in range(n_pts):
+        s = total * k / n_pts
+        while j + 1 < len(cum) and cum[j + 1] < s - 1e-12:
+            j += 1
+        seg = cum[j + 1] - cum[j]
+        if seg < 1e-12:
+            out_x.append(pts[j % m][0])
+            out_y.append(pts[j % m][1])
+            continue
+        t = (s - cum[j]) / seg
+        p1, p2 = pts[j % m], pts[(j + 1) % m]
+        out_x.append(p1[0] + t * (p2[0] - p1[0]))
+        out_y.append(p1[1] + t * (p2[1] - p1[1]))
+    return np.array(out_x), np.array(out_y)
+
+
+def build_spanwise_surface(station_data, smooth=0.0):
+    """对每个弦向索引 j 做展向 Pchip 插值 (C1), 重建 3D 叶片曲面。
+
+    station_data: list of (r_m, pts_3d)  其中 pts_3d 是 [(x,y,z), ...]  mm 单位
+    smooth: 0.0 → PchipInterpolator (C1, 过点).  >0 → UnivariateSpline (光滑但不保证过点).
+
+    返回: 与 station_data 相同结构的 smoothed_pts_3d (每站坐标由展向样条曲面评估得到)
+    """
+    if len(station_data) < 2:
+        return [list(pts) for _, pts in station_data]
+
+    r_arr = np.array([r for r, _ in station_data])
+    n_af = len(station_data[0][1])
+    for _, pts in station_data:
+        if len(pts) != n_af:
+            raise ValueError("所有截面必须具有相同点数 — 请先用 normalize_airfoil_closed")
+
+    # 为每个弦向索引 j 建立展向插值器
+    interpolators = []
+    for j in range(n_af):
+        x_j = np.array([pts[j][0] for _, pts in station_data])
+        y_j = np.array([pts[j][1] for _, pts in station_data])
+        z_j = np.array([pts[j][2] for _, pts in station_data])
+        if smooth > 0:
+            from scipy.interpolate import UnivariateSpline
+            ip_x = UnivariateSpline(r_arr, x_j, s=smooth)
+            ip_y = UnivariateSpline(r_arr, y_j, s=smooth)
+            ip_z = UnivariateSpline(r_arr, z_j, s=smooth)
+        else:
+            ip_x = PchipInterpolator(r_arr, x_j)
+            ip_y = PchipInterpolator(r_arr, y_j)
+            ip_z = PchipInterpolator(r_arr, z_j)
+        interpolators.append((ip_x, ip_y, ip_z))
+
+    # 在每站 r 处评估
+    result = []
+    for i, (r, _) in enumerate(station_data):
+        pts_smooth = []
+        for ip_x, ip_y, ip_z in interpolators:
+            pts_smooth.append((float(ip_x(r)), float(ip_y(r)), float(ip_z(r))))
+        result.append(pts_smooth)
+    return result
+
+
 # ================================================================
 # 4. 写文件
 # ================================================================
@@ -359,7 +452,7 @@ def main():
     twist_arr = _twist_array
     n         = len(r_arr)
 
-    # ---- 第一步: 读 + 变换 ----
+    # ---- 第一步: 归一化翼型 + 变换 ----
     af_cache = {}
     raw_sections = []   # list of (idx, r, c, t, af_name, [(X,Y,Z), ...])
     for idx in range(n):
@@ -369,11 +462,29 @@ def main():
             raw_sections.append((idx, r, c, t, None, None))
             continue
         if af_name not in af_cache:
-            af_cache[af_name] = read_selig_dat(os.path.join(AIRFOIL_DIR, af_name + ".dat"))
+            x_raw, y_raw = read_selig_dat(os.path.join(AIRFOIL_DIR, af_name + ".dat"))
+            # 归一化到一致点数 → 弦向参数一致 (展向样条必需)
+            af_cache[af_name] = normalize_airfoil_closed(x_raw, y_raw, N_AF_POINTS)
         x_af, y_af = af_cache[af_name]
         X, Y, Z = transform_section(x_af, y_af, c, t, r)
         pts = list(zip(X.tolist(), Y.tolist(), Z.tolist()))
         raw_sections.append((idx, r, c, t, af_name, pts))
+
+    # ---- 第二步: 展向样条曲面 (重建 QBlade 内部 3D 曲面, 保证 C1 连续) ----
+    valid_entries = [(i, r, pts) for i, (_, r, _, _, _, pts) in enumerate(raw_sections) if pts is not None]
+    if len(valid_entries) >= 2 and N_AF_POINTS >= 4:
+        station_data = [(r, pts) for _, r, pts in valid_entries]
+        smoothed = build_spanwise_surface(station_data, smooth=SPANWISE_SMOOTH)
+        for k, (i, r, _) in enumerate(valid_entries):
+            _, _, c, t, af_name, _ = raw_sections[i]
+            raw_sections[i] = (raw_sections[i][0], r, c, t, af_name, smoothed[k])
+        n_span = len(station_data)
+        n_af = len(station_data[0][1])
+        print(f"\n  展向曲面: {n_span} 站 × {n_af} 点, Pchip C1 连续 (smooth={SPANWISE_SMOOTH})")
+    elif N_AF_POINTS < 4:
+        print(f"\n  展向曲面: 已跳过 (N_AF_POINTS={N_AF_POINTS}<4)")
+    else:
+        print(f"\n  展向曲面: 已跳过 (有效截面<2)")
 
     # ---- 第二步: pipeline (dedup + direction + axes + align + resample + close) ----
     prepared = []   # list of (idx, r, c, t, af_name, pts_processed, n_dedup, was_closed)
@@ -406,7 +517,8 @@ def main():
     # ---- 第三步: align_start + resample + close + write ----
     print("=" * 110)
     print(f"  叶片截面导出 — 桨距轴 @ {PITCH_AXIS_FRAC*100:.0f}% 弦,  twist_sign = {TWIST_SIGN:+d}")
-    print(f"  Pipeline:  dedup<{DEDUP_TOL_MM}mm  →  dir={LOOP_DIRECTION}"
+    print(f"  Pipeline:  norm_af={N_AF_POINTS}pts  →  spanwise_spline(Pchip, s={SPANWISE_SMOOTH})"
+          f"  →  dedup<{DEDUP_TOL_MM}mm  →  dir={LOOP_DIRECTION}"
           f"  →  align_start={ALIGN_START}  →  resample N={RESAMPLE_N}  →  closed={CLOSE_CURVE}")
     print(f"  输入:  硬编码叶片几何 (r, chord, twist) — 修改 §1 重跑")
     print(f"  输出:  {OUT_DIR}")
