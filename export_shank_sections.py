@@ -27,7 +27,7 @@ Domain A: 结构桨柄 + 法兰过渡截面导出
 设计依据:
   - 桨柄 NACA 对称截面 → DU 翼型的平滑过渡
   - r=0 毂体中心: 262mm 宽 × 50mm 厚 NACA 0025 (与 Φ262 圆柱合并)
-  - r=0→0.200: 恒定 262×50 (hub 区域, 提供平滑放样起点)
+  - r=0→0.350: 直接膨胀过渡, 无恒截面段 (减冗余质量)
   - 桨柄厚度 50→105 mm: 铺层 ply drop 累积区 + 离心承拉
   - t/c 全程维持 ~19-20%, 与 DU-06-W-200 (19.8%) 一致
 ========================================================
@@ -57,7 +57,6 @@ OUT_DIR     = os.path.join(WORK_DIR, "cad_sections")
 # thickness = 最大厚度 (mm)
 SHANK_STATIONS = [
     (0.000, "ellipse", -131, +131,  50,  0.0),   # r=0 毂体中心: 262x50, 与圆柱合并
-    (0.200, "ellipse", -131, +131,  50,  0.0),   # 根板对接面: 262mm宽, t/c=19.1%
     (0.350, "ellipse", -146, +222,  72,  9.0),   # 桨柄中段, width=368, t/c=19.6%
     (0.500, "ellipse", -162, +313,  93, 14.0),   # 桨柄末端, width=475, t/c=19.6%
     (0.580, "blend",   -170, +362, 105, 16.0),   # 过渡形: width=532, t/c=19.7%→DU
@@ -553,17 +552,13 @@ def main():
     print("  Domain A SolidWorks 操作:")
     print("    1. 插入→曲线→曲线通过 XYZ 点 → 按序加载 4 个 shank_section_*.sldcrv")
     print("    2. 插入→曲面/凸台→放样:")
-    print("       - 轮廓顺序: r0.200 → r0.350 → r0.500 → r0.580 → r0.676 (DU)")
+    print("       - 轮廓顺序: r0.000 → r0.350 → r0.500 → r0.580 → r0.676 (DU)")
     print("       - 起始/终止约束 = '无'")
     print("       - 推荐加 3 条引导线: LE 连线, TE 连线, max-thickness 连线")
-    print("         (3D 草图→通过各截面同序号点画样条)")
-    print("    3. 法兰: 在 r=0.200 平面建草图 → 外径 220mm 圆盘, 厚 15-20mm")
-    print("       - 钻 8×M16 通孔, PCD=180mm")
-    print("       - 法兰与桨柄根部合并 (Combine/Merge)")
-    print("    4. Domain A 与 Domain B 对接:")
+    print("    3. 与 Domain B 对接:")
     print(f"       - DU 截面 (r={DU_R:.3f}m) 是共享轮廓")
-    print("       - 两侧 loft 实体在 DU 面处合并, 或预先画一个 DU 曲面作为相切约束")
-    print(f"    5. 气动整流罩 (可选): 单独旋转体覆盖法兰+螺栓头")
+    print("       - shank 放样 + blade 放样在 DU 截面处合并")
+    print("    4. 毂体圆柱合并: 见 export_hub_geometry.py 输出指引")
 
 
 if __name__ == "__main__":

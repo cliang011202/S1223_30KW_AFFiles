@@ -78,7 +78,7 @@ gamma_f_fat  = 1.00    # 疲劳载荷分项
 gamma_m_fat  = 1.25    # 疲劳材料分项
 
 # ---- 叶根螺栓预校核 (可选) ----
-n_bolts        = 8
+n_bolts        = 4
 bolt_PCD       = 0.18  # 螺栓节圆直径 [m]
 bolt_label     = "M16 8.8"
 bolt_proof_kN  = 88.0  # M16 8.8 屈服拉力 ≈ 88 kN

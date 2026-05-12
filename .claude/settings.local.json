@@ -26,7 +26,13 @@
       "PowerShell(/e/anaconda3/python.exe export_root_plate.py)",
       "PowerShell(E:\\\\anaconda3\\\\python.exe export_root_plate.py)",
       "PowerShell(E:\\\\anaconda3\\\\python.exe export_shank_sections.py)",
-      "PowerShell(E:\\\\anaconda3\\\\python.exe export_hub_geometry.py)"
+      "PowerShell(E:\\\\anaconda3\\\\python.exe export_hub_geometry.py)",
+      "PowerShell(E:\\\\anaconda3\\\\python.exe E:\\\\CCBlade\\\\test\\\\S1223_30KW_AFFiles\\\\export_blade_sections.py)",
+      "PowerShell(E:\\\\anaconda3\\\\python.exe -c \"import numpy as np; c=np.load\\(r'E:\\\\CCBlade\\\\test\\\\S1223_30KW_AFFiles\\\\chord_optimization_results_AEP.npz'\\); t=np.load\\(r'E:\\\\CCBlade\\\\test\\\\S1223_30KW_AFFiles\\\\twist_optimization_results_AEP.npz'\\); print\\('NPZ keys chord:', list\\(c.keys\\(\\)\\)\\); print\\('NPZ keys twist:', list\\(t.keys\\(\\)\\)\\); print\\('r:', c.get\\('r'\\)\\); print\\('chord_opt:', c.get\\('chord_opt'\\)\\); print\\('twist_opt:', t.get\\('twist_opt'\\)\\)\")",
+      "Bash(E:/anaconda3/python.exe *)",
+      "Read(//e/anaconda3/**)",
+      "Bash(\"E:/anaconda3/Scripts/conda.exe\" info *)",
+      "Bash(E:/anaconda3_envs/envs/blade_opt/python.exe *)"
     ]
   }
 }

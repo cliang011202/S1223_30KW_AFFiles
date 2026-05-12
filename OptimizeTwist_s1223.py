@@ -95,7 +95,7 @@ f_weights = np.array([0.537, 0.164, 0.125, 0.083, 0.091])
 n_cases   = len(V_cases)
 I_PEAK    = 2   # 能量峰值工况索引 (V=7.5 m/s)
 
-n_opt_twist = 2
+n_opt_twist = 1
 n_opt_chord = 8
 
 r = np.array([  0.202 ,0.350 ,0.676 ,0.967 ,1.135 ,
@@ -690,146 +690,301 @@ else:
 
 
 # ================================================================
-# 8c. 扭角光滑后处理（修正外叶片平台区）
+# 8c. 保存 SLSQP 原始最优解（后续光滑以此为基准，防止偏差叠加）
+# ================================================================
+
+best_twist_raw = best_twist.copy()
+best_AEP_raw   = best_AEP
+
+# ================================================================
+# 8d. 扭角光滑后处理（修正外叶片平台区）
 # ================================================================
 # 问题：SLSQP 在叶尖段梯度平坦区容易停滞，导致 idx 7–12 收敛到相同值（"平台"）。
-# 修正：UnivariateSpline 光滑 + 强制单调递减，
-#       评估 AEP 损失；损失 < 1% 则接受光滑结果。
-# 锚点：idx 2（DU段起点，失速约束驱动）和 idx 13（叶尖）赋高权重严格通过。
+# 修正：两种光滑策略竞争 —
+#   - PchipInterpolator : 保单调 C1 插值（数据已光滑时最优，严格保端点）
+#   - UnivariateSpline  : 光滑样条（有平台时用，s>0 抹平阶梯，端点高权重锚定）
+#   所有候选从 SLSQP 原始最优 (best_twist_raw) 出发拟合，避免偏差叠加。
 
+from scipy.interpolate import PchipInterpolator as _Pchip
 from scipy.interpolate import UnivariateSpline as _USpline
+from scipy.interpolate import CubicSpline as _CubicSpline
 
 
-def _smooth_twist(twist_full, s_factor=0.5):
+def _smooth_twist_pchip(twist_full):
     """
-    对非圆柱段扭角做光滑样条拟合，并强制单调递减。
+    PchipInterpolator: 保单调三次 Hermite 插值。
+    在严格通过所有数据点的同时保证 C1 连续和单调递减。
+    适用于 SLSQP 已产出光滑扭角的场景（无平台时 AEP 损失最小）。
     圆柱段（idx 0–1）保持原值不变。
     """
     idx    = NON_CYL_IDX                      # [2, 3, ..., 13]
     r_nc   = r[idx]
     tw_nc  = twist_full[idx].copy()
-    n_nc   = len(idx)                          # 12
 
-    weights      = np.ones(n_nc)
-    weights[0]   = 1e4                         # idx 2  — 失速约束锚点
-    weights[-1]  = 1e4                         # idx 13 — 叶尖锚点
-
-    spl   = _USpline(r_nc, tw_nc, w=weights, k=3, s=s_factor * n_nc)
+    spl   = _Pchip(r_nc, tw_nc)
     tw_sp = spl(r_nc)
-
-    # 强制单调递减（修正样条局部上翘）
-    for j in range(1, n_nc):
-        if tw_sp[j] > tw_sp[j - 1]:
-            tw_sp[j] = tw_sp[j - 1]
 
     result      = twist_full.copy()
     result[idx] = tw_sp
     return result
 
 
-print("\n" + "=" * 60)
-print("8c. 扭角光滑后处理（修正外叶片平台区）")
-print("=" * 60)
+def _smooth_twist_spline(twist_full, s_factor=1.0, endpoint_weight=1e4):
+    """
+    UnivariateSpline 光滑样条：用 s>0 抹平 SLSQP 阶梯状平台。
+    k=3 三次样条保证 C2 连续，不用于强制单调（交给选优逻辑过滤）。
+    圆柱段（idx 0–1）保持原值不变。
 
-# 检测平台区（非圆柱段相邻截面扭角差 < 0.05°）
-noncyl_twist   = best_twist[NON_CYL_IDX]
+    endpoint_weight: 端点权重。1e4=严格锚定（原始 spline-2.0），
+                     10=轻度锚定允许叶尖浮动打破平台。
+    """
+    idx    = NON_CYL_IDX
+    r_nc   = r[idx]
+    tw_nc  = twist_full[idx].copy()
+    n_nc   = len(idx)
+
+    w          = np.ones(n_nc)
+    w[0]       = endpoint_weight
+    w[-1]      = endpoint_weight
+
+    spl   = _USpline(r_nc, tw_nc, w=w, k=3, s=s_factor * n_nc)
+    tw_sp = spl(r_nc)
+
+    result      = twist_full.copy()
+    result[idx] = tw_sp
+    return result
+
+
+def _smooth_twist_pruned(twist_full, plateau_tol=0.08):
+    """
+    平台去重 + Pchip 插值：去掉相邻差值 < plateau_tol 的重复平台点，
+    保留每组平台的第一个点（代表平台起点），对去重后的稀疏点做 Pchip 插值。
+    结果沿 SLSQP 趋势平滑过渡，比 Betz 更贴近原始数据，比纯 Pchip 更光滑。
+    """
+    idx    = NON_CYL_IDX
+    r_nc   = r[idx]
+    tw_nc  = twist_full[idx].copy()
+    n_nc   = len(idx)
+
+    keep = [True] * n_nc
+    for j in range(1, n_nc - 1):
+        if abs(tw_nc[j] - tw_nc[j - 1]) < plateau_tol:
+            keep[j] = False
+    keep[0] = True; keep[-1] = True
+
+    r_sparse  = r_nc[keep]
+    tw_sparse = tw_nc[keep]
+
+    if len(r_sparse) < 3:
+        spl = _Pchip(r_nc, tw_nc)
+    else:
+        spl = _Pchip(r_sparse, tw_sparse)
+
+    tw_sp = spl(r_nc)
+    result = twist_full.copy()
+    result[idx] = tw_sp
+    return result
+
+
+def _prune_anchors(twist_full, plateau_tol=0.08):
+    """去平台：返回稀疏锚点的 (r_sparse, tw_sparse, keep_mask)"""
+    idx      = NON_CYL_IDX
+    r_nc     = r[idx]
+    tw_nc    = twist_full[idx].copy()
+    n_nc     = len(idx)
+    keep = [True] * n_nc
+    for j in range(1, n_nc - 1):
+        if abs(tw_nc[j] - tw_nc[j - 1]) < plateau_tol:
+            keep[j] = False
+    keep[0] = True; keep[-1] = True
+    return r_nc[keep], tw_nc[keep], keep
+
+
+def _smooth_twist_pruned_poly(twist_full):
+    """去平台 + 加权 poly-5 拟合稀疏锚点"""
+    idx = NON_CYL_IDX
+    r_nc = r[idx]
+    r_sp, tw_sp = _prune_anchors(twist_full)[:2]
+    if len(r_sp) < 4:
+        return _smooth_twist_pruned(twist_full)
+    t_sp = (r_sp - r_sp[0]) / (r_sp[-1] - r_sp[0])
+    tw_fit = _fit_poly_tw_weighted(t_sp, tw_sp, 5)
+    spl = _Pchip(r_sp, tw_fit)
+    tw_out = spl(r_nc)
+    result = twist_full.copy()
+    result[idx] = tw_out
+    return result
+
+
+def _smooth_twist_pruned_bezier(twist_full):
+    """去平台 + bezier-5 拟合稀疏锚点（端点精确保持）"""
+    idx = NON_CYL_IDX
+    r_nc = r[idx]
+    r_sp, tw_sp = _prune_anchors(twist_full)[:2]
+    if len(r_sp) < 4:
+        return _smooth_twist_pruned(twist_full)
+    t_sp = (r_sp - r_sp[0]) / (r_sp[-1] - r_sp[0])
+    tw_fit = _fit_bezier_tw(t_sp, tw_sp, 5)
+    spl = _Pchip(r_sp, tw_fit)
+    tw_out = spl(r_nc)
+    result = twist_full.copy()
+    result[idx] = tw_out
+    return result
+
+
+def _smooth_twist_pruned_cspline(twist_full):
+    """去平台 + CubicSpline C2 自然边界插值。
+    CubicSpline 提供 C² 连续性（d²θ/dr² 在节点处连续，端点 natural BC → d²θ/dr²=0），
+    与 SolidWorks B-spline 曲面放样的连续性阶数匹配，从根源上消除边界振荡。
+    圆柱段（idx 0–1）保持原值不变。
+    """
+    idx = NON_CYL_IDX
+    r_nc = r[idx]
+    r_sp, tw_sp = _prune_anchors(twist_full)[:2]
+    if len(r_sp) < 4:
+        return _smooth_twist_pruned(twist_full)
+    cs = _CubicSpline(r_sp, tw_sp, bc_type="natural")
+    tw_out = cs(r_nc)
+    result = twist_full.copy()
+    result[idx] = tw_out
+    return result
+
+
+def _smooth_twist_regularized(twist_full, lam=1.0, fix_tip=True):
+    """
+    正则化单调光滑 — 求解凸二次规划:
+      min  ||θ − θ_slsqp||² + λ·||D²θ||²
+      s.t. θ[i] ≤ θ[i−1]   (单调递减)
+           θ[-1] = θ_slsqp[-1]  (叶尖锚定，不被正则化拉偏)
+    其中 D² 是二阶差分矩阵。λ 控制光滑度:
+      λ 小 → 贴近 SLSQP (保留平台, 推力不变)
+      λ 大 → 光滑优先 (消除平台, 推力可能增加)
+    工程解释: 单一可调参数 λ, 在保真度与光滑度之间做 Pareto 最优权衡。
+    """
+    from scipy.optimize import minimize as _minimize
+
+    idx = NON_CYL_IDX
+    tw_ref = twist_full[idx].copy()
+    n = len(tw_ref)
+
+    D2 = np.zeros((n - 2, n))
+    for i in range(n - 2):
+        D2[i, i] = 1.0
+        D2[i, i + 1] = -2.0
+        D2[i, i + 2] = 1.0
+    H = D2.T @ D2
+
+    def objective(theta):
+        diff = theta - tw_ref
+        curv = D2 @ theta
+        return float(np.dot(diff, diff) + lam * np.dot(curv, curv))
+
+    def gradient(theta):
+        diff = theta - tw_ref
+        return 2.0 * diff + 2.0 * lam * (H @ theta)
+
+    cons = []
+    for i in range(1, n):
+        cons.append({"type": "ineq", "fun": lambda t, j=i: t[j - 1] - t[j]})
+    if fix_tip:
+        cons.append({"type": "eq", "fun": lambda t: t[-1] - tw_ref[-1]})
+
+    bounds = [(twist_init_deg[idx[i]] - 8.0, twist_init_deg[idx[i]] + 8.0) for i in range(n)]
+
+    res = _minimize(objective, tw_ref, method="SLSQP", jac=gradient,
+                    bounds=bounds, constraints=cons,
+                    options={"maxiter": 500, "ftol": 1e-10})
+    result = twist_full.copy()
+    result[idx] = res.x
+    return result
+
+
+def _smooth_twist_betz_curvature(twist_full, lam=1.0):
+    """
+    Betz 曲率引导光滑 — 保持 SLSQP 的值，曲率变化模式向 Betz 靠拢:
+      min  ||θ − θ_slsqp||² + λ·||D²θ − D²θ_betz||²
+      s.t. θ[i] ≤ θ[i−1]   (单调递减)
+    Betz 提供 C∞ 曲率模板，λ 控制曲率跟随强度。
+    工程解释: 复制 Betz 的曲率连续变化模式，但保持 SLSQP 气动最优值。
+    """
+    from scipy.optimize import minimize as _minimize
+
+    idx = NON_CYL_IDX
+    tw_ref = twist_full[idx].copy()
+    tw_betz = twist_betz_deg[idx].copy()
+    n = len(tw_ref)
+
+    D2 = np.zeros((n - 2, n))
+    for i in range(n - 2):
+        D2[i, i] = 1.0
+        D2[i, i + 1] = -2.0
+        D2[i, i + 2] = 1.0
+    curv_betz = D2 @ tw_betz
+    D2T_D2 = D2.T @ D2
+    D2T_cb = D2.T @ curv_betz
+
+    def objective(theta):
+        diff = theta - tw_ref
+        cdiff = D2 @ theta - curv_betz
+        return float(np.dot(diff, diff) + lam * np.dot(cdiff, cdiff))
+
+    def gradient(theta):
+        diff = theta - tw_ref
+        return 2.0 * diff + 2.0 * lam * (D2T_D2 @ theta - D2T_cb)
+
+    cons = []
+    for i in range(1, n):
+        cons.append({"type": "ineq", "fun": lambda t, j=i: t[j - 1] - t[j]})
+
+    bounds = [(twist_init_deg[idx[i]] - 8.0, twist_init_deg[idx[i]] + 8.0) for i in range(n)]
+
+    res = _minimize(objective, tw_ref, method="SLSQP", jac=gradient,
+                    bounds=bounds, constraints=cons,
+                    options={"maxiter": 500, "ftol": 1e-10})
+    result = twist_full.copy()
+    result[idx] = res.x
+    return result
+
+
+# ---- 平台检测（仅报告，不修改 best_twist） ----
+noncyl_twist   = best_twist_raw[NON_CYL_IDX]
 diffs_nc       = np.diff(noncyl_twist)
 plateau_mask   = np.abs(diffs_nc) < 0.05
 n_plateau_orig = int(np.sum(plateau_mask))
 
 if n_plateau_orig > 0:
     plat_segs = [NON_CYL_IDX[k] for k in range(len(NON_CYL_IDX) - 1) if plateau_mask[k]]
-    print(f"检测到 {n_plateau_orig} 处相邻截面平台（|Δθ| < 0.05°），"
+    print(f"\n[平台检测] 检测到 {n_plateau_orig} 处相邻截面平台（|Δθ| < 0.05°），"
           f"涉及截面 idx: {plat_segs}")
 else:
-    print("未检测到平台区，扭角分布已足够光滑，跳过光滑步骤。")
-
-# 渐进式光滑：依次尝试，选第一个平台消减且 AEP 损失 < 1% 的方案
-print(f"\n原始 AEP_proxy = {best_AEP:.2f} W")
-print(f"  {'s_factor':>8s}  {'AEP_proxy(W)':>14s}  {'损失%':>9s}  {'剩余平台数':>10s}  {'接受?':>5s}")
-
-best_smooth_twist = None
-best_smooth_AEP   = None
-
-for s_try in [0.1, 0.3, 0.6, 1.0, 2.0]:
-    tw_s  = _smooth_twist(best_twist, s_factor=s_try)
-    best_prob.set_val("theta_in", tw_s, units="deg")
-    best_prob.run_model()
-    AEP_s = best_prob.get_val("AEP")[0]
-    loss  = (best_AEP - AEP_s) / abs(best_AEP) * 100.0
-
-    n_plat_s = int(np.sum(np.abs(np.diff(tw_s[NON_CYL_IDX])) < 0.05))
-    accept   = (loss < 1.0) and (n_plat_s < n_plateau_orig or n_plateau_orig == 0)
-    print(f"  {s_try:8.1f}  {AEP_s:14.2f}  {loss:9.4f}%  {n_plat_s:10d}  "
-          f"{'✓' if accept else '✗'}")
-
-    if accept and best_smooth_twist is None:
-        best_smooth_twist = tw_s.copy()
-        best_smooth_AEP   = AEP_s
-
-# 判断是否接受光滑结果
-if best_smooth_twist is not None:
-    loss_final = (best_AEP - best_smooth_AEP) / abs(best_AEP) * 100.0
-    print(f"\n[光滑决策] 接受光滑方案，AEP 损失 = {loss_final:.4f}%  (< 1%)")
-
-    # 验证光滑后失速约束（5 工况 × 12 非圆柱截面）
-    best_prob.set_val("theta_in", best_smooth_twist, units="deg")
-    best_prob.run_model()
-    print("光滑后失速约束验证:")
-    all_stall_ok = True
-    for i in range(n_cases):
-        alpha_i = best_prob.get_val(f"alpha_{i}", units="deg")
-        for k, nc_idx in enumerate(NON_CYL_IDX):
-            if alpha_i[nc_idx] > ALPHA_UPPER_NSEC[k] + 0.10:   # 0.1° 容差
-                print(f"  ⚠ V={V_cases[i]:.1f} m/s, idx={nc_idx}: "
-                      f"α={alpha_i[nc_idx]:.2f}° > {ALPHA_UPPER_NSEC[k]:.1f}°")
-                all_stall_ok = False
-    if all_stall_ok:
-        print("  ✓ 所有截面失速约束满足")
-
-    print(f"\n光滑后扭角 (idx 2–13): {np.round(best_smooth_twist[NON_CYL_IDX], 2).tolist()}")
-
-    # 用光滑结果替换最优值（best_prob 已在光滑状态，供 Section 9 读取）
-    best_twist = best_smooth_twist.copy()
-    best_AEP   = best_smooth_AEP
-
-else:
-    # 未找到可接受方案：恢复 best_prob 到原始最优状态
-    best_prob.set_val("theta_in", best_twist, units="deg")
-    best_prob.run_model()
-    print("\n[光滑决策] 未找到满足 AEP 损失 < 1% 的光滑方案，保留原始优化扭角。")
+    print("\n[平台检测] 未检测到平台区，扭角分布已足够光滑。")
 
 
 # ================================================================
-# 8d. 工程光滑后处理：参数化曲线拟合（工程质量优先，允许 AEP 损失）
+# 8d. 统一光滑后处理：Pchip + 参数化拟合公平竞争
 # ================================================================
-# 从叶片设计工程视角，光滑扭角分布的工程价值：
-#   ① 单调递减 + C∞ 连续 → 无锯齿、避免 3D 流动分离与应力集中
-#   ② 低曲率             → 便于模具加工与纤维铺层
-#   ③ 物理一致           → 可用 Betz 最优入流角模板直接生成
-# 8c 已在 ΔAEP ≤ 1% 内做过样条光滑；本节允许更高 AEP 损失
-# (_AEP_LOSS_ENG_TOL，默认 3%)，以换取更强的工程可制造性。
+# 所有候选从 SLSQP 原始最优 (best_twist_raw) 出发拟合，避免 §8c→§8d 偏差叠加。
 # 候选方案：
-#   - 多项式拟合 (阶 3/4/5)  : C∞ 连续、数学光滑
-#   - Bezier 曲线 (n_ctrl 4/5/6) : 端点精确保持 (根部 DU / 叶尖锚点不偏移)
-#   - 反比模型 θ(r) = A/r + B    : 叶片扭角经典工程形式
-#   - Betz 模板 θ(r) = φ_Betz(r) − α_des : 物理一致（源自 BEM 最优解）
-# 选优：AEP 损失 ≤ 容限 且 单调递减 且 所有工况失速约束满足，取曲率最小者。
+#   - Pchip         : 保单调三次 Hermite 插值，C1 连续，严格通过所有数据点
+#   - poly-3/4/5    : 加权多项式拟合（端点权重 100× 锚定叶根/叶尖）
+#   - bezier-4/5/6  : 端点精确保持
+#   - 1/r           : 叶片扭角经典反比模型
+#   - Betz          : 物理一致模板（自由参数仅 α_des）
+# 选优：ΔAEP ≤ 容限 + 单调 + 失速 + 叶尖偏差 ≤ 1° → 取 AEP 损失最小，同损失取曲率最小。
 
 from scipy.special import comb as _comb
 from scipy.optimize import least_squares as _lsq
 
-_AEP_LOSS_ENG_TOL  = 3.0   # %, AEP 损失容忍上限（工程质量优先，可放宽）
-_AEP_LOSS_ENG_WARN = 2.0   # %, AEP 损失警告阈值
 _STALL_TOL_DEG     = 0.10  # 失速约束容差 (deg)
 
 print("\n" + "=" * 60)
-print(f"8d. 工程光滑后处理（参数化拟合，AEP 损失容限 {_AEP_LOSS_ENG_TOL:.1f}%）")
+print("8d. 统一光滑后处理（Pchip + 参数化拟合）")
 print("=" * 60)
 
-_r_var_e   = r[NON_CYL_IDX[0]:]                   # idx 2..13
-_tw_base_e = best_twist[NON_CYL_IDX[0]:].copy()   # deg
-_AEP_ref_e = best_AEP
+# 所有拟合从 SLSQP 原始最优出发
+_r_var_e   = r[NON_CYL_IDX[0]:]                        # idx 2..13
+_tw_base_e = best_twist_raw[NON_CYL_IDX[0]:].copy()    # deg — SLSQP 原始最优，不被 §8c 修改
+_AEP_ref_e = best_AEP_raw
 _t_norm_e  = (_r_var_e - _r_var_e[0]) / (_r_var_e[-1] - _r_var_e[0])
 
 
@@ -858,18 +1013,21 @@ def _fit_bezier_tw(t_norm, tw_arr, n_ctrl):
     return _bezier_curve_tw(t_norm, ctrl_full)
 
 
-def _fit_poly_tw(t_norm, tw_arr, order):
-    """阶数为 order 的多项式最小二乘拟合（t 归一化以改善数值条件）"""
-    coef = np.polyfit(t_norm, tw_arr, order)
+def _fit_poly_tw_weighted(t_norm, tw_arr, order):
+    """加权多项式最小二乘拟合：端点权重 100× 锚定叶根/叶尖，避免末端漂移"""
+    w = np.ones(len(tw_arr))
+    w[0] = 100.0
+    w[-1] = 100.0
+    A = np.vander(t_norm, order + 1)
+    W = np.diag(np.sqrt(w))
+    coef, _, _, _ = np.linalg.lstsq(W @ A, W @ tw_arr, rcond=None)
     return np.polyval(coef, t_norm)
-
 
 def _fit_inverse_r(r_arr, tw_arr):
     """θ(r) = A/r + B 反比模型（叶片扭角经典形式）"""
     def residual(params):
         A, B = params
         return A / r_arr + B - tw_arr
-    # 初值：用两端点解析求解
     A_init = (tw_arr[0] - tw_arr[-1]) * r_arr[0] * r_arr[-1] / (r_arr[-1] - r_arr[0])
     B_init = tw_arr[-1] - A_init / r_arr[-1]
     res = _lsq(residual, [A_init, B_init])
@@ -880,7 +1038,7 @@ def _fit_inverse_r(r_arr, tw_arr):
 def _fit_betz_template(r_arr, tw_arr, tsr_val, R_tip):
     """
     Betz 模板：θ(r) = φ_Betz(r; λ=tsr·r/R) − α_des
-    自由参数仅 α_des（度），与 Section 2 的 _betz_twist_deg 一致，物理动机最强。
+    自由参数仅 α_des（度），物理动机最强。
     """
     lam  = tsr_val * r_arr / R_tip
     disc = np.sqrt(1.0 + 8.0 / (9.0 * lam ** 2))
@@ -893,37 +1051,73 @@ def _fit_betz_template(r_arr, tw_arr, tsr_val, R_tip):
     return phi - res.x[0]
 
 
-def _eval_twist_aep_and_stall(twist_full_deg):
-    """设置扭角，运行 BEM，返回 (AEP, 失速是否通过)"""
-    best_prob.set_val("theta_in", twist_full_deg, units="deg")
-    best_prob.run_model()
-    aep = best_prob.get_val("AEP")[0]
-    stall_ok = True
-    nc_arr = np.array(NON_CYL_IDX)
-    for _ci in range(n_cases):
-        _a = best_prob.get_val(f"alpha_{_ci}", units="deg")
-        if np.any(_a[nc_arr] > ALPHA_UPPER_NSEC + _STALL_TOL_DEG):
-            stall_ok = False
-            break
-    return aep, stall_ok
-
-
-# ----- 构建候选方案 -----
+# 所有候选从 SLSQP 原始最优出发
 _cands_e = []
 
-for _ord in [3, 4, 5]:
-    try:
-        _tw_s = _fit_poly_tw(_t_norm_e, _tw_base_e, _ord)
-        _cands_e.append((f"poly-{_ord}", _tw_s))
-    except Exception as _ex:
-        print(f"  poly-{_ord} 拟合失败: {_ex}")
+# Pchip: 保单调三次 Hermite 插值（数据光滑时最优）
+try:
+    _tw_s = _smooth_twist_pchip(best_twist_raw)[NON_CYL_IDX[0]:]
+    _cands_e.append(("pchip", _tw_s))
+except Exception as _ex:
+    print(f"  pchip 拟合失败: {_ex}")
 
-for _n in [4, 5, 6]:
-    try:
-        _tw_s = _fit_bezier_tw(_t_norm_e, _tw_base_e, _n)
-        _cands_e.append((f"bezier-{_n}", _tw_s))
-    except Exception as _ex:
-        print(f"  bezier-{_n} 拟合失败: {_ex}")
+# Pchip-pruned: 平台去重后 Pchip 插值（沿 SLSQP 趋势平滑，比 Betz 更贴近数据）
+try:
+    _tw_s = _smooth_twist_pruned(best_twist_raw)[NON_CYL_IDX[0]:]
+    _cands_e.append(("pchip-prune", _tw_s))
+except Exception as _ex:
+    print(f"  pchip-prune 拟合失败: {_ex}")
+
+# cspline-prune: 去平台 + CubicSpline C2 自然边界（匹配 SW B-spline 连续性）
+try:
+    _tw_s = _smooth_twist_pruned_cspline(best_twist_raw)[NON_CYL_IDX[0]:]
+    _cands_e.append(("cspline-prune", _tw_s))
+except Exception as _ex:
+    print(f"  cspline-prune 拟合失败: {_ex}")
+
+# poly5-pruned / bezier5-pruned: 去平台 + 拟合稀疏锚点
+# 注意：与 pchip-prune 效果几乎相同（锚点相同，Pchip 插值结果一致），保留以备验证
+
+# UnivariateSpline: 强光滑样条（s=2.0 用于抹平严重平台）
+try:
+    _tw_s = _smooth_twist_spline(best_twist_raw, s_factor=2.0)[NON_CYL_IDX[0]:]
+    _cands_e.append(("spline-2.0", _tw_s))
+except Exception as _ex:
+    print(f"  spline-2.0 拟合失败: {_ex}")
+
+# UnivariateSpline C2 轻光滑 (端点权重10, 逐步增大 s 打破全部平台):
+#   s=0.1: 仅打破叶尖平台，内部平台残留
+#   s=0.3: 中等光滑，应打破多数平台
+#   s=0.5: 预期打破全部平台的最小 s
+try:
+    _tw_s = _smooth_twist_spline(best_twist_raw, s_factor=0.1, endpoint_weight=10.0)[NON_CYL_IDX[0]:]
+    _cands_e.append(("spline-0.1", _tw_s))
+except Exception as _ex:
+    print(f"  spline-0.1 拟合失败: {_ex}")
+try:
+    _tw_s = _smooth_twist_spline(best_twist_raw, s_factor=0.3, endpoint_weight=10.0)[NON_CYL_IDX[0]:]
+    _cands_e.append(("spline-0.3", _tw_s))
+except Exception as _ex:
+    print(f"  spline-0.3 拟合失败: {_ex}")
+try:
+    _tw_s = _smooth_twist_spline(best_twist_raw, s_factor=0.5, endpoint_weight=10.0)[NON_CYL_IDX[0]:]
+    _cands_e.append(("spline-0.5", _tw_s))
+except Exception as _ex:
+    print(f"  spline-0.5 拟合失败: {_ex}")
+
+# 多项式: poly-5（高阶，灵活拟合）
+try:
+    _tw_s = _fit_poly_tw_weighted(_t_norm_e, _tw_base_e, 5)
+    _cands_e.append(("poly-5", _tw_s))
+except Exception as _ex:
+    print(f"  poly-5 拟合失败: {_ex}")
+
+# Bezier: 仅保留 5 阶（端点固定，中间 3 个控制点）
+try:
+    _tw_s = _fit_bezier_tw(_t_norm_e, _tw_base_e, 5)
+    _cands_e.append(("bezier-5", _tw_s))
+except Exception as _ex:
+    print(f"  bezier-5 拟合失败: {_ex}")
 
 try:
     _tw_s = _fit_inverse_r(_r_var_e, _tw_base_e)
@@ -937,70 +1131,211 @@ try:
 except Exception as _ex:
     print(f"  Betz 模板拟合失败: {_ex}")
 
-# ----- 评价每个候选 -----
-print(f"\n{'方案':>10s}  {'曲率(×10⁻⁴)':>12s}  {'最大偏差(°)':>11s}  "
-      f"{'AEP(W)':>10s}  {'ΔAEP%':>8s}  {'单调':>4s}  {'失速':>4s}")
-print("-" * 78)
+# 多比例混合：pchip-prune 与 poly-5 的加权平均
+_tw_prune = next((tw for name, tw in _cands_e if name == "pchip-prune"), None)
+_tw_poly5 = next((tw for name, tw in _cands_e if name == "poly-5"), None)
+if _tw_prune is not None and _tw_poly5 is not None:
+    _cands_e.append(("avg(prune+poly5)", (_tw_prune + _tw_poly5) / 2.0))
+    _cands_e.append(("blend75-25", _tw_prune * 0.75 + _tw_poly5 * 0.25))
 
+# 轻量 Betz 混合: 保持 SLSQP 值, 仅掺少量 Betz 引入曲率连续性
+_tw_betz_nc = twist_betz_deg[NON_CYL_IDX[0]:]
+for _alpha, _b_label in [(0.05, "betz-5%"), (0.10, "betz-10%"), (0.15, "betz-15%")]:
+    _cands_e.append((_b_label, (1.0 - _alpha) * _tw_base_e + _alpha * _tw_betz_nc))
+
+# 正则化单调光滑：min ||θ-θ_slsqp||² + λ·||D²θ||², s.t. 单调递减
+# λ 越大越光滑（推力可能增加），λ 越小越贴近 SLSQP（保留平台）
+for _lam, _lam_label in [(0.1, "reg-0.1"), (0.3, "reg-0.3"), (1.0, "reg-1.0"),
+                          (3.0, "reg-3.0"), (10.0, "reg-10")]:
+    try:
+        _tw_s = _smooth_twist_regularized(best_twist_raw, lam=_lam)[NON_CYL_IDX[0]:]
+        _cands_e.append((_lam_label, _tw_s))
+    except Exception as _ex:
+        print(f"  {_lam_label} 失败: {_ex}")
+
+# Betz 曲率引导光滑: 保持 SLSQP 值, 曲率变化模式跟随 Betz
+for _lam, _lam_label in [(0.5, "betz-curv-0.5"), (1.0, "betz-curv-1.0"),
+                          (3.0, "betz-curv-3.0"), (10.0, "betz-curv-10")]:
+    try:
+        _tw_s = _smooth_twist_betz_curvature(best_twist_raw, lam=_lam)[NON_CYL_IDX[0]:]
+        _cands_e.append((_lam_label, _tw_s))
+    except Exception as _ex:
+        print(f"  {_lam_label} 失败: {_ex}")
+
+# ----- 评价每个候选 + 计算推力 -----
 _lo_e = (twist_init_deg - 8.0)[NON_CYL_IDX[0]:]
 _hi_e = (twist_init_deg + 8.0)[NON_CYL_IDX[0]:]
+
+def _eval_twist_full(twist_full_deg):
+    """运行 BEM，返回 (AEP, T_peak, stall_ok)"""
+    best_prob.set_val("theta_in", twist_full_deg, units="deg")
+    best_prob.run_model()
+    aep = best_prob.get_val("AEP")[0]
+    Px_peak = best_prob.get_val(f"Px_b_{I_PEAK}")
+    T_peak = np.trapz(Px_peak, r) * n_blades
+    stall_ok = True
+    nc_arr = np.array(NON_CYL_IDX)
+    for _ci in range(n_cases):
+        _a = best_prob.get_val(f"alpha_{_ci}", units="deg")
+        if np.any(_a[nc_arr] > ALPHA_UPPER_NSEC + _STALL_TOL_DEG):
+            stall_ok = False
+            break
+    return aep, T_peak, stall_ok
 
 _log_e = []
 for _name, _tw_s in _cands_e:
     _tw_clip = np.clip(_tw_s, _lo_e, _hi_e)
+    # 单调化 + C1 连续: 用 Pchip 重拟合替代 minimum.accumulate
+    # (minimum.accumulate 制造 C0 扭折 → SolidWorks 放样自相交)
+    if not np.all(np.diff(_tw_clip) <= 1e-6):
+        for j in range(1, len(_tw_clip)):
+            if _tw_clip[j] > _tw_clip[j - 1]:
+                _tw_clip[j] = _tw_clip[j - 1] - 1e-4  # 微下调, 避免 Pchip 压平
+        _tw_clip = _Pchip(_r_var_e, _tw_clip)(_r_var_e)
     _mono    = bool(np.all(np.diff(_tw_clip) <= 1e-6))
-    _tw_full = best_twist.copy()
+    _tw_full = best_twist_raw.copy()
     _tw_full[NON_CYL_IDX[0]:] = _tw_clip
 
-    _aep_i, _stall_ok = _eval_twist_aep_and_stall(_tw_full)
+    _aep_i, _T_i, _stall_ok = _eval_twist_full(_tw_full)
     _loss_i = (_AEP_ref_e - _aep_i) / _AEP_ref_e * 100.0
     _curv_i = _second_diff_cost_tw(_tw_clip)
     _mdev_i = float(np.max(np.abs(_tw_clip - _tw_base_e)))
+    _tip_i  = float(abs(_tw_clip[-1] - _tw_base_e[-1]))
 
     _log_e.append({
         "name": _name, "twist": _tw_clip, "twist_full": _tw_full.copy(),
-        "AEP": _aep_i, "loss_pct": _loss_i, "curvature": _curv_i,
-        "mono": _mono, "max_dev": _mdev_i, "stall_ok": _stall_ok,
+        "AEP": _aep_i, "T_peak": _T_i, "loss_pct": _loss_i, "curvature": _curv_i,
+        "mono": _mono, "max_dev": _mdev_i, "tip_dev": _tip_i, "stall_ok": _stall_ok,
     })
-    print(f"  {_name:>8s}  {_curv_i * 1e4:12.6f}  {_mdev_i:11.5f}  "
-          f"{_aep_i:10.1f}  {_loss_i:+8.3f}%  "
-          f"{'✓' if _mono else '✗':>4s}  {'✓' if _stall_ok else '✗':>4s}")
 
-# ----- 选优：AEP 损失 ≤ 容限 + 单调递减 + 失速约束满足，取曲率最小 -----
-_valid_e = [lg for lg in _log_e
-            if lg["loss_pct"] <= _AEP_LOSS_ENG_TOL
-            and lg["mono"] and lg["stall_ok"]]
+# 计算 SLSQP 原始的 AEP 和 T 作为基准
+_AEP_slsqp, _T_slsqp, _ = _eval_twist_full(best_twist_raw)
 
-if not _valid_e:
-    print(f"\n[工程光滑] 无候选同时满足 (ΔAEP ≤ {_AEP_LOSS_ENG_TOL:.1f}% + 单调 + 失速)，"
-          f"保留 8c 结果。")
-    # 恢复 best_prob 到 8c 最优状态
-    best_prob.set_val("theta_in", best_twist, units="deg")
-    best_prob.run_model()
+# ----- 筛选满足失速条件的候选 -----
+_stall_ok_cands = [lg for lg in _log_e if lg["stall_ok"]]
+
+print(f"\n{'=' * 100}")
+print(f"  光滑方案对比 — 满足失速约束的候选 ({len(_stall_ok_cands)}/{len(_log_e)})")
+print(f"  SLSQP 原始: AEP={_AEP_slsqp:.1f} W  T_peak={_T_slsqp:.1f} N")
+print(f"{'=' * 100}")
+print(f"  {'方案':>10s}  {'AEP(W)':>10s}  {'ΔAEP%':>8s}  {'T_peak(N)':>10s}  "
+      f"{'ΔT%':>7s}  {'曲率e-4':>8s}  {'max_dev°':>8s}  {'tip_dev°':>8s}  {'单调':>4s}")
+print(f"  {'-' * 86}")
+for lg in _stall_ok_cands:
+    _dT_pct = (lg["T_peak"] - _T_slsqp) / _T_slsqp * 100.0 if _T_slsqp != 0 else 0.0
+    print(f"  {lg['name']:>10s}  {lg['AEP']:10.1f}  {lg['loss_pct']:+8.3f}%  "
+          f"{lg['T_peak']:10.1f}  {_dT_pct:+7.2f}%  {lg['curvature']*1e4:8.1f}  "
+          f"{lg['max_dev']:8.4f}  {lg['tip_dev']:8.4f}  "
+          f"{'✓' if lg['mono'] else '✗':>4s}")
+
+# ----- 推荐：以 pchip-prune 光滑度为基准，找推力增加最小的方案 -----
+_prune_ref = next((lg for lg in _log_e if lg["name"] == "pchip-prune"), None)
+if _prune_ref and _prune_ref["stall_ok"] and _prune_ref["mono"]:
+    _curv_ref = _prune_ref["curvature"]
+    _CURV_TOL = 0.30  # 曲率在 pchip-prune ±30% 内视为"类似光滑度"
+    _AEP_LOSS_ACCEPT = 3.0  # %, 可接受的 AEP 损失上限
+
+    _similar = [lg for lg in _stall_ok_cands
+                if lg["mono"]
+                and abs(lg["curvature"] - _curv_ref) / _curv_ref <= _CURV_TOL
+                and lg["loss_pct"] <= _AEP_LOSS_ACCEPT]
+    _similar.sort(key=lambda lg: abs((lg["T_peak"] - _T_slsqp) / _T_slsqp))
+
+    print(f"\n  {'=' * 90}")
+    print(f"  推荐基准: pchip-prune (曲率={_curv_ref*1e4:.0f}e-4, ΔT={( _prune_ref['T_peak']-_T_slsqp)/_T_slsqp*100:+.2f}%)")
+    print(f"  筛选条件: 曲率在 ±{_CURV_TOL*100:.0f}% 内, ΔAEP ≤ {_AEP_LOSS_ACCEPT:.1f}%, 单调+失速OK")
+    if _similar:
+        print(f"  排序: 推力增加最小 → 最大")
+        print(f"  {'排名':>4s}  {'方案':>12s}  {'ΔT%':>8s}  {'ΔAEP%':>8s}  {'曲率e-4':>8s}  {'tip_dev°':>10s}")
+        for _rank, lg in enumerate(_similar, 1):
+            _dt = (lg["T_peak"] - _T_slsqp) / _T_slsqp * 100.0
+            _marker = "  ← 最佳" if _rank == 1 else ""
+            print(f"  {_rank:>4d}  {lg['name']:>12s}  {_dt:+8.3f}%  {lg['loss_pct']:+8.3f}%  "
+                  f"{lg['curvature']*1e4:8.0f}  {lg['tip_dev']:10.4f}{_marker}")
+    else:
+        print(f"  ⚠ 无候选满足曲率相似条件")
 else:
-    _best_e = min(_valid_e, key=lambda lg: lg["curvature"])
-    _curv_b = _second_diff_cost_tw(_tw_base_e)
-    _impv_e = ((1.0 - _best_e["curvature"] / _curv_b) * 100.0
-               if _curv_b > 0 else 0.0)
+    print(f"\n  ⚠ pchip-prune 不可用，无法建立光滑度基准")
 
-    print(f"\n[工程光滑] 最优方案: {_best_e['name']}")
-    print(f"  曲率 (×10⁻⁴)       : {_curv_b * 1e4:.6f} → "
-          f"{_best_e['curvature'] * 1e4:.6f}  (改善 {_impv_e:.1f}%)")
-    print(f"  最大扭角偏差       : {_best_e['max_dev']:.4f}°")
-    print(f"  AEP 损失           : {_best_e['loss_pct']:+.3f}%")
-    if _best_e["loss_pct"] > _AEP_LOSS_ENG_WARN:
-        print(f"  ⚠ AEP 损失 > {_AEP_LOSS_ENG_WARN:.1f}%，请工程师确认是否接受。")
+# ----- 最终方案: 强制 Betz（唯一通过 SW 曲面放样验证的方案）-----
+_betz_cand = next((lg for lg in _log_e if lg["name"] == "Betz"), None)
+if _betz_cand and _betz_cand["stall_ok"] and _betz_cand["mono"]:
+    best_twist = _betz_cand["twist_full"]
+    best_AEP   = _betz_cand["AEP"]
+    _dt_final = (_betz_cand["T_peak"] - _T_slsqp) / _T_slsqp * 100.0
+    print(f"\n  ✓ 已选定 Betz (C∞): ΔT={_dt_final:+.2f}%, ΔAEP={_betz_cand['loss_pct']:+.3f}%")
+else:
+    print(f"\n  ⚠ Betz 不可用，回退到 SLSQP 原始")
+    best_twist = best_twist_raw.copy()
+    best_AEP   = best_AEP_raw
 
-    print(f"\n  {'r(m)':>6s}  {'优化扭角':>10s}  {'工程光滑':>10s}  {'Δtwist':>8s}")
-    for _rj, _tob, _tse in zip(r[NON_CYL_IDX[0]:], _tw_base_e, _best_e["twist"]):
-        print(f"  {_rj:6.3f}  {_tob:10.4f}  {_tse:10.4f}  {_tse - _tob:+8.4f}")
+best_prob.set_val("theta_in", best_twist, units="deg")
+best_prob.run_model()
 
-    best_twist = _best_e["twist_full"]
-    best_AEP   = _best_e["AEP"]
-    # 将 best_prob 设为最终方案（供下游 Section 9/10 读取气动量）
-    best_prob.set_val("theta_in", best_twist, units="deg")
-    best_prob.run_model()
-    print(f"\n  → 已采用工程光滑结果（制造/结构友好，工程质量优先）")
+_avg_full = None
+_b75_ref = None  # 使用 Betz 时不需要 blend 参考
+
+# ----- 可视化: Initial + SLSQP + Final + betz blends -----
+# 提取 betz 混合候选（满足失速+单调的）
+_betz_blends = [lg for lg in _log_e
+                if lg["name"].startswith("betz-") and lg["stall_ok"] and lg["mono"]]
+_betz_blends.sort(key=lambda lg: lg["name"])
+
+try:
+    import matplotlib.pyplot as _plt
+
+    _r_full = r[NON_CYL_IDX[0]:]
+    _tw_init_nc = twist_init_deg[NON_CYL_IDX[0]:]
+    _tw_final = best_twist[NON_CYL_IDX[0]:]
+
+    _fig, (_ax1, _ax2) = _plt.subplots(1, 2, figsize=(16, 6))
+    _final_label = "Betz (C∞)"
+    _fig.suptitle(f"Twist comparison: {_final_label} + betz blends vs SLSQP vs Initial", fontsize=14)
+
+    _ax1.plot(_r_full, _tw_init_nc, "s--", color="gray", ms=5, lw=1.8, label="Initial (twist_init_deg)")
+    _ax1.plot(_r_full, _tw_base_e, "ko-", ms=6, lw=2.5, label="SLSQP optimum")
+    _ax1.plot(_r_full, _tw_final, "D-", color="#d62728", ms=6, lw=2.5, label=f"Final: {_final_label}")
+    # blend75-25 参考 (仅当 final ≠ blend75-25 时显示)
+    if _b75_ref and _b75_ref["stall_ok"] and _b75_ref["mono"]:
+        _ax1.plot(_r_full, _b75_ref["twist"], "s-", color="#ff7f0e", ms=4, lw=1.5,
+                  label=f"ref blend75-25  ΔT={(_b75_ref['T_peak']-_T_slsqp)/_T_slsqp*100:+.2f}%")
+
+    # betz 混合曲线 (绿→蓝渐变)
+    _b_colors = ["#2ca02c", "#17becf", "#1f77b4"]
+    for _k, _bc in enumerate(_betz_blends):
+        _col = _b_colors[_k % 3]
+        _ax1.plot(_r_full, _bc["twist"], "o-", color=_col, ms=4, lw=1.5,
+                  label=f"{_bc['name']}  ΔT={(_bc['T_peak']-_T_slsqp)/_T_slsqp*100:+.2f}%")
+
+    _ax1.set_xlabel("r (m)"); _ax1.set_ylabel("Twist (deg)")
+    _ax1.set_title("Full span"); _ax1.legend(fontsize=8); _ax1.grid(True, alpha=0.3)
+
+    _mask_tip = _r_full >= 1.8
+    _ax2.plot(_r_full[_mask_tip], _tw_init_nc[_mask_tip], "s--", color="gray", ms=5, lw=1.8, label="Initial")
+    _ax2.plot(_r_full[_mask_tip], _tw_base_e[_mask_tip], "ko-", ms=6, lw=2.5, label="SLSQP optimum")
+    _ax2.plot(_r_full[_mask_tip], _tw_final[_mask_tip], "D-", color="#d62728", ms=6, lw=2.5,
+              label=f"Final: {_final_label}")
+    if _b75_ref and _b75_ref["stall_ok"] and _b75_ref["mono"]:
+        _ax2.plot(_r_full[_mask_tip], _b75_ref["twist"][_mask_tip], "s-", color="#ff7f0e", ms=4, lw=1.5,
+                  label="ref blend75-25")
+    for _k, _bc in enumerate(_betz_blends):
+        _col = _b_colors[_k % 3]
+        _ax2.plot(_r_full[_mask_tip], _bc["twist"][_mask_tip], "o-", color=_col, ms=4, lw=1.5,
+                  label=f"{_bc['name']}")
+    for i in range(len(_r_full)):
+        if _mask_tip[i]:
+            _ax2.annotate(f"{_tw_final[i]:.2f}", (_r_full[i], _tw_final[i]),
+                         textcoords="offset points", xytext=(0, 10), fontsize=7, color="#d62728", ha="center")
+    _ax2.set_xlabel("r (m)"); _ax2.set_ylabel("Twist (deg)")
+    _ax2.set_title("Tip region  (r >= 1.8 m)"); _ax2.legend(fontsize=9); _ax2.grid(True, alpha=0.3)
+
+    _plt.tight_layout()
+    _plot_path = "twist_final_comparison.png"
+    _fig.savefig(_plot_path, dpi=150, bbox_inches="tight")
+    _plt.close(_fig)
+    print(f"  最终对比图已保存: {_plot_path}")
+except Exception as _ex:
+    print(f"  [可视化跳过] {_ex}")
 
 
 # ================================================================
@@ -1108,8 +1443,10 @@ print(f"{'':>20s}  {'CP / P(W) / T(N)':>20s}  {'CP / P(W) / T(N)':>20s}  {'CP / 
 print("-" * 90)
 
 results_eval = {}
-for label, theta_rad in [("优化前 (初始扭角)", np.deg2rad(twist_init_deg)),
-                          ("优化后 (AEP最优)",  theta_in_opt_rad)]:
+_eval_label_final = "Betz (C∞)"
+_eval_rows = [("优化前 (初始扭角)", np.deg2rad(twist_init_deg)),
+              (f"优化后 ({_eval_label_final})", theta_in_opt_rad)]
+for label, theta_rad in _eval_rows:
     row = {}
     for V in V_eval:
         cp, p, t = _eval_at(V, theta_rad)
@@ -1122,16 +1459,17 @@ for label, theta_rad in [("优化前 (初始扭角)", np.deg2rad(twist_init_deg)
     print(f"{label:>20s}  {vals}")
 
 print()
-print("各项变化量 (优化后 - 优化前):")
-print(f"  {'指标':>6s}  {'V=3 m/s':>14s}  {'V=5 m/s':>14s}  {'V=15 m/s':>14s}  {'V=18 m/s':>14s}")
-for metric, idx, unit in [("ΔCP", 0, ""), ("ΔP(W)", 1, "W"), ("ΔT(N)", 2, "N")]:
-    row_before = results_eval["优化前 (初始扭角)"]
-    row_after  = results_eval["优化后 (AEP最优)"]
-    diffs = "  ".join(
-        f"  {row_after[V][idx] - row_before[V][idx]:+12.4f}"
-        for V in V_eval
-    )
-    print(f"  {metric:>6s}  {diffs}")
+print("各项变化量 (优化后 / 参考 - 优化前):")
+print(f"  {'指标':>6s}  {'方案':>22s}  {'V=3 m/s':>14s}  {'V=5 m/s':>14s}  {'V=15 m/s':>14s}  {'V=18 m/s':>14s}")
+row_before = results_eval["优化前 (初始扭角)"]
+for label, theta_rad in _eval_rows[1:]:  # skip 优化前
+    row_after = results_eval[label]
+    for metric, idx in [("ΔCP", 0), ("ΔP(W)", 1), ("ΔT(N)", 2)]:
+        diffs = "  ".join(
+            f"  {row_after[V][idx] - row_before[V][idx]:+12.4f}"
+            for V in V_eval
+        )
+        print(f"  {metric:>6s}  {label:>20s}  {diffs}")
 
 
 # ================================================================

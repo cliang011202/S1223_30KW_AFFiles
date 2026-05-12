@@ -6,8 +6,7 @@ SolidWorks "曲线通过 XYZ 点" 可直接导入的 .sldcrv 文件。
 输出闭合曲线 (末点 = 首点), 适用于放样 + 填充曲面。
 
 输入:
-  - chord_optimization_results_AEP.npz   (r, chord_opt)
-  - twist_optimization_results_AEP.npz   (twist_opt, 单位 °)
+  - 叶片几何参数 (r, chord, twist) 直接在 §1 中以数组形式定义
   - origin/{S1223,SD7062,SG6050,DU-06-W-200}.dat  (Selig 单位翼型坐标)
 
 输出:
@@ -47,10 +46,20 @@ PITCH_AXIS_FRAC = 0.30        # 桨距轴在弦上的位置 (0=LE, 1=TE)
 TWIST_SIGN      = +1          # 扭转方向: +1=RH about +z; SW 里反向则改 -1
 
 WORK_DIR    = r"E:\CCBlade\test\S1223_30KW_AFFiles"
-NPZ_CHORD   = "chord_optimization_results_AEP.npz"
-NPZ_TWIST   = "twist_optimization_results_AEP.npz"
 AIRFOIL_DIR = os.path.join(WORK_DIR, "origin")
 OUT_DIR     = os.path.join(WORK_DIR, "cad_sections")
+
+# ---- 叶片几何参数 (修改此处即可重跑, 无需依赖 .npz) ----
+# r [m], chord [m], twist [deg] — 14 站 (idx 0–13)
+_r_array  = np.array([0.202, 0.350, 0.676, 0.967, 1.135,
+                      1.483, 1.664, 1.850, 2.036, 2.217,
+                      2.398, 2.565, 3.024, 3.498])
+_chord_array = np.array([0.2500, 0.2500, 0.6000, 0.5192, 0.4681,
+                          0.3500, 0.3200, 0.2896, 0.2536, 0.2224,
+                          0.1954, 0.1741, 0.1331, 0.1182])
+_twist_array = np.array([18.20, 18.20, 16.96, 11.07,  8.75,
+                            5.37,  4.11,  3.06,  3.18,  2.46,
+                            1.84,  1.34,  0.25, -0.58])
 
 # idx → 翼型文件名 (无 .dat 扩展)。None = 不导出 (圆柱段)
 AIRFOIL_MAP = {
@@ -345,14 +354,10 @@ def plot_preview(sections, out_path):
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
 
-    chd = np.load(os.path.join(WORK_DIR, NPZ_CHORD))
-    twt = np.load(os.path.join(WORK_DIR, NPZ_TWIST))
-    r_arr     = chd["r"]
-    chord_arr = chd["chord_opt"]
-    twist_arr = twt["twist_opt"]
+    r_arr     = _r_array
+    chord_arr = _chord_array
+    twist_arr = _twist_array
     n         = len(r_arr)
-    if not (len(chord_arr) == len(twist_arr) == n):
-        raise RuntimeError("r / chord_opt / twist_opt 长度不一致")
 
     # ---- 第一步: 读 + 变换 ----
     af_cache = {}
@@ -403,7 +408,7 @@ def main():
     print(f"  叶片截面导出 — 桨距轴 @ {PITCH_AXIS_FRAC*100:.0f}% 弦,  twist_sign = {TWIST_SIGN:+d}")
     print(f"  Pipeline:  dedup<{DEDUP_TOL_MM}mm  →  dir={LOOP_DIRECTION}"
           f"  →  align_start={ALIGN_START}  →  resample N={RESAMPLE_N}  →  closed={CLOSE_CURVE}")
-    print(f"  输入:  {NPZ_CHORD} / {NPZ_TWIST}")
+    print(f"  输入:  硬编码叶片几何 (r, chord, twist) — 修改 §1 重跑")
     print(f"  输出:  {OUT_DIR}")
     print("=" * 110)
     print(f"  {'idx':>3}  {'r [m]':>7}  {'chord [m]':>9}  {'twist [°]':>9}  {'airfoil':<14}  "
@@ -453,7 +458,7 @@ def main():
         fh.write(f"# pipeline: dedup<{DEDUP_TOL_MM}mm | dir={LOOP_DIRECTION} | "
                  f"align={ALIGN_START} | resample={RESAMPLE_N} | closed={CLOSE_CURVE}\n")
         fh.write(f"# unit: mm | newline: CRLF | sep: TAB\n")
-        fh.write(f"# data source: {NPZ_CHORD} / {NPZ_TWIST}\n#\n")
+        fh.write(f"# data source: §1 硬编码数组 (_r_array, _chord_array, _twist_array)\n#\n")
         fh.write(f"# {'idx':>3}  {'r[m]':>7}  {'chord[m]':>9}  {'twist[deg]':>10}  {'airfoil':<14}  file\n")
         for row in summary_rows:
             fh.write(f"  {row[0]:>3d}  {row[1]:>7.3f}  {row[2]:>9.4f}  {row[3]:>10.3f}  {row[4]:<14}  {row[5]}\n")
