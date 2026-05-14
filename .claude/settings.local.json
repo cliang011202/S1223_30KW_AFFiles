@@ -35,7 +35,12 @@
       "Bash(E:/anaconda3_envs/envs/blade_opt/python.exe *)",
       "WebSearch",
       "WebFetch(domain:github.com)",
-      "WebFetch(domain:docs.qblade.org)"
+      "WebFetch(domain:docs.qblade.org)",
+      "Bash(Get-ChildItem 'E:\\\\CCBlade\\\\test\\\\S1223_30KW_AFFiles\\\\CAD\\\\cad_case4')",
+      "Bash(Select-Object Name)",
+      "Bash(Select-Object FullName)",
+      "Bash(Get-Content *)",
+      "PowerShell(Get-Content *)"
     ]
   }
 }
