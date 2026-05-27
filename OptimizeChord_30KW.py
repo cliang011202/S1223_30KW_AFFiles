@@ -764,240 +764,249 @@ else:
 
 
 # ================================================================
-# 8d. 弦长曲线光滑优化（曲率最小化，AEP 损失 ≤ 1%）
+# 8d. [已禁用] 弦长曲线光滑优化（曲率最小化）
 # ================================================================
-# 当前弦长在翼型段交界处存在折点（二阶不连续）：
-#   - idx 4→5  (r≈1.14→1.48 m): DU-06-W-200 / SG6050 边界，坡度突变
-#   - idx 10→11 (r≈2.40→2.57 m): SD7062 / S1223 边界，坡度突变
-# 本步骤搜索最大样条平滑因子，在 AEP 损失 ≤ 1% 的前提下使离散曲率
-# （二阶差分平方和）最小化，改善工程造型质量。
+# 原因: 含 Prandtl tip loss 的最优弦长在叶尖段 (r > 2.5m) 应快速下降
+#   (Wind Energy Handbook Fig 3.37: 叶尖段 blade geometry parameter
+#   约为无 tip loss 的一半)。曲率最小化会惩罚叶尖段的快速弦长变化，
+#   将物理上正确的 tip-loss-driven chord drop 抹平为近似线性 taper。
+# 如需重新启用：设 ENABLE_SMOOTHING_8D = True
+ENABLE_SMOOTHING_8D = False
 
-print("\n" + "=" * 60)
-print("8d. 弦长曲线光滑优化（曲率最小化）")
-print("=" * 60)
+if ENABLE_SMOOTHING_8D:
+    print("\n" + "=" * 60)
+    print("8d. 弦长曲线光滑优化（曲率最小化）")
+    print("=" * 60)
 
-_AEP_LOSS_TOL  = 1.0   # AEP 损失容忍上限 (%)
-_AEP_LOSS_WARN = 0.5   # AEP 损失警告阈值 (%)
+if not ENABLE_SMOOTHING_8D:
+    print()
+    print("=" * 60)
+    print("8d,8e. [跳过] 曲率最小化 & 参数化拟合")
+    print("=" * 60)
+    print("ENABLE_SMOOTHING_8D=False, tip loss driven chord drop preserved")
+else:
+    _AEP_LOSS_TOL  = 1.0   # AEP 损失容忍上限 (%)
+    _AEP_LOSS_WARN = 0.5   # AEP 损失警告阈值 (%)
 
-r_var    = r[n_fix:]
-c_base   = best_chord[n_fix:].copy()
-n_var_sm = len(r_var)
+    r_var    = r[n_fix:]
+    c_base   = best_chord[n_fix:].copy()
+    n_var_sm = len(r_var)
 
 
-def _second_diff_cost(c_arr):
-    """离散二阶差分平方和（曲率代理，越小越平滑）"""
-    return float(np.sum(np.diff(np.diff(c_arr)) ** 2))
+    def _second_diff_cost(c_arr):
+        """离散二阶差分平方和（曲率代理，越小越平滑）"""
+        return float(np.sum(np.diff(np.diff(c_arr)) ** 2))
 
 
-sf_grid    = [0.0, 5e-5, 1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 3e-2, 6e-2, 0.10, 0.20]
-smooth_log = []
-AEP_ref    = best_AEP
+    sf_grid    = [0.0, 5e-5, 1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 3e-2, 6e-2, 0.10, 0.20]
+    smooth_log = []
+    AEP_ref    = best_AEP
 
-print(f"\n搜索平滑因子（AEP 损失容限 {_AEP_LOSS_TOL:.1f}%）:")
-print(f"  {'sf':>8s}  {'曲率(×10⁻⁴)':>12s}  {'AEP(W)':>10s}  {'ΔAEP%':>8s}  {'单调':>4s}")
+    print(f"\n搜索平滑因子（AEP 损失容限 {_AEP_LOSS_TOL:.1f}%）:")
+    print(f"  {'sf':>8s}  {'曲率(×10⁻⁴)':>12s}  {'AEP(W)':>10s}  {'ΔAEP%':>8s}  {'单调':>4s}")
 
-for _sf in sf_grid:
-    if _sf <= 0:
-        _c_s = c_base.copy()
+    for _sf in sf_grid:
+        if _sf <= 0:
+            _c_s = c_base.copy()
+        else:
+            _spl = _USpline(r_var, c_base, k=3, s=_sf * n_var_sm)
+            _c_s = _spl(r_var)
+        _c_s    = np.clip(_c_s, chord_lower[n_fix:], chord_upper[n_fix:])
+        _mono   = bool(np.all(np.diff(_c_s) <= 1e-8))
+        _c_full = best_chord.copy()
+        _c_full[n_fix:] = _c_s
+        _aep_s, _prob_s = _eval_aep_only(_c_full)
+        _loss   = (AEP_ref - _aep_s) / AEP_ref * 100.0
+        _curv   = _second_diff_cost(_c_s)
+        smooth_log.append({
+            "sf": _sf, "chord": _c_s.copy(), "AEP": _aep_s,
+            "loss_pct": _loss, "curvature": _curv,
+            "mono": _mono, "prob": _prob_s,
+        })
+        print(f"  {_sf:8.2e}  {_curv * 1e4:12.6f}  {_aep_s:10.1f}  {_loss:+8.3f}%  {'✓' if _mono else '✗'}")
+
+    # 选 AEP 损失 ≤ 容限且弦长单调递减的方案中曲率最小（最平滑）的
+    _valid_sm = [lg for lg in smooth_log
+                 if lg["loss_pct"] <= _AEP_LOSS_TOL and lg["mono"]]
+    if not _valid_sm:
+        # 放宽单调约束（单调递减已由 8c 保证，此处仅为兜底）
+        _valid_sm = [lg for lg in smooth_log if lg["loss_pct"] <= _AEP_LOSS_TOL]
+
+    if not _valid_sm:
+        print(f"\n[曲线光滑] 所有平滑因子均超过 AEP 损失 {_AEP_LOSS_TOL:.1f}%，跳过。")
     else:
-        _spl = _USpline(r_var, c_base, k=3, s=_sf * n_var_sm)
-        _c_s = _spl(r_var)
-    _c_s    = np.clip(_c_s, chord_lower[n_fix:], chord_upper[n_fix:])
-    _mono   = bool(np.all(np.diff(_c_s) <= 1e-8))
-    _c_full = best_chord.copy()
-    _c_full[n_fix:] = _c_s
-    _aep_s, _prob_s = _eval_aep_only(_c_full)
-    _loss   = (AEP_ref - _aep_s) / AEP_ref * 100.0
-    _curv   = _second_diff_cost(_c_s)
-    smooth_log.append({
-        "sf": _sf, "chord": _c_s.copy(), "AEP": _aep_s,
-        "loss_pct": _loss, "curvature": _curv,
-        "mono": _mono, "prob": _prob_s,
-    })
-    print(f"  {_sf:8.2e}  {_curv * 1e4:12.6f}  {_aep_s:10.1f}  {_loss:+8.3f}%  {'✓' if _mono else '✗'}")
+        _chosen = min(_valid_sm, key=lambda lg: lg["curvature"])
+        _chord_sm = best_chord.copy()
+        _chord_sm[n_fix:] = _chosen["chord"]
 
-# 选 AEP 损失 ≤ 容限且弦长单调递减的方案中曲率最小（最平滑）的
-_valid_sm = [lg for lg in smooth_log
-             if lg["loss_pct"] <= _AEP_LOSS_TOL and lg["mono"]]
-if not _valid_sm:
-    # 放宽单调约束（单调递减已由 8c 保证，此处仅为兜底）
-    _valid_sm = [lg for lg in smooth_log if lg["loss_pct"] <= _AEP_LOSS_TOL]
+        _curv_base = _second_diff_cost(c_base)
+        _curv_impv = (1.0 - _chosen["curvature"] / _curv_base) * 100.0 if _curv_base > 0 else 0.0
 
-if not _valid_sm:
-    print(f"\n[曲线光滑] 所有平滑因子均超过 AEP 损失 {_AEP_LOSS_TOL:.1f}%，跳过。")
-else:
-    _chosen = min(_valid_sm, key=lambda lg: lg["curvature"])
-    _chord_sm = best_chord.copy()
-    _chord_sm[n_fix:] = _chosen["chord"]
+        print(f"\n[曲线光滑] 最优方案  sf = {_chosen['sf']:.2e}")
+        print(f"  光滑前曲率 (×10⁻⁴) : {_curv_base * 1e4:.6f}")
+        print(f"  光滑后曲率 (×10⁻⁴) : {_chosen['curvature'] * 1e4:.6f}  (改善 {_curv_impv:.1f}%)")
+        print(f"  AEP 损失            : {_chosen['loss_pct']:+.3f}%")
+        if _chosen["loss_pct"] > _AEP_LOSS_WARN:
+            print(f"  ⚠ AEP 损失超过 {_AEP_LOSS_WARN:.1f}%，请确认是否接受。")
 
-    _curv_base = _second_diff_cost(c_base)
-    _curv_impv = (1.0 - _chosen["curvature"] / _curv_base) * 100.0 if _curv_base > 0 else 0.0
+        # 打印光滑前后弦长对比
+        print(f"\n  {'r(m)':>6s}  {'优化弦长':>10s}  {'光滑弦长':>10s}  {'Δchord':>8s}")
+        for _j, (_r, _co, _cs) in enumerate(zip(r[n_fix:], c_base, _chosen["chord"])):
+            print(f"  {_r:6.3f}  {_co:10.4f}  {_cs:10.4f}  {_cs - _co:+8.4f}")
 
-    print(f"\n[曲线光滑] 最优方案  sf = {_chosen['sf']:.2e}")
-    print(f"  光滑前曲率 (×10⁻⁴) : {_curv_base * 1e4:.6f}")
-    print(f"  光滑后曲率 (×10⁻⁴) : {_chosen['curvature'] * 1e4:.6f}  (改善 {_curv_impv:.1f}%)")
-    print(f"  AEP 损失            : {_chosen['loss_pct']:+.3f}%")
-    if _chosen["loss_pct"] > _AEP_LOSS_WARN:
-        print(f"  ⚠ AEP 损失超过 {_AEP_LOSS_WARN:.1f}%，请确认是否接受。")
-
-    # 打印光滑前后弦长对比
-    print(f"\n  {'r(m)':>6s}  {'优化弦长':>10s}  {'光滑弦长':>10s}  {'Δchord':>8s}")
-    for _j, (_r, _co, _cs) in enumerate(zip(r[n_fix:], c_base, _chosen["chord"])):
-        print(f"  {_r:6.3f}  {_co:10.4f}  {_cs:10.4f}  {_cs - _co:+8.4f}")
-
-    best_chord = _chord_sm
-    best_AEP   = _chosen["AEP"]
-    best_prob  = _chosen["prob"]
-    print(f"\n  → 已采用光滑弦长结果")
+        best_chord = _chord_sm
+        best_AEP   = _chosen["AEP"]
+        best_prob  = _chosen["prob"]
+        print(f"\n  → 已采用光滑弦长结果")
 
 
-# ================================================================
-# 8e. 工程光滑后处理：参数化曲线拟合（工程质量优先，允许 AEP 损失）
-# ================================================================
-# 从叶片设计工程视角，光滑弦长分布的工程价值：
-#   ① 单调递减 + C∞ 连续 → 无锯齿、无应力集中、无 3D 流动分离
-#   ② 低曲率             → 便于模具加工与纤维铺层贴合
-#   ③ 根段到叶尖自然收束 → 结构-气动匹配良好
-# 8d 已在 ΔAEP ≤ 1% 内做过样条光滑；本节允许更高 AEP 损失
-# (_AEP_LOSS_ENG_TOL，默认 3%)，以换取更强的工程可制造性。
-# 候选方案：
-#   - 多项式拟合 (阶 2/3/4/5)：C∞ 连续、无任何锯齿
-#   - Bezier 曲线 (n_ctrl 4/5/6)：端点严格保持、形状可控
-#   - 幂律模型 c(r) = a·(R−r)^p + b：经典变桨叶片工程形式
-# 选优：AEP 损失 ≤ 容限 且 单调递减，取曲率代理最小者。
+    # ================================================================
+    # 8e. 工程光滑后处理：参数化曲线拟合（工程质量优先，允许 AEP 损失）
+    # ================================================================
+    # 从叶片设计工程视角，光滑弦长分布的工程价值：
+    #   ① 单调递减 + C∞ 连续 → 无锯齿、无应力集中、无 3D 流动分离
+    #   ② 低曲率             → 便于模具加工与纤维铺层贴合
+    #   ③ 根段到叶尖自然收束 → 结构-气动匹配良好
+    # 8d 已在 ΔAEP ≤ 1% 内做过样条光滑；本节允许更高 AEP 损失
+    # (_AEP_LOSS_ENG_TOL，默认 3%)，以换取更强的工程可制造性。
+    # 候选方案：
+    #   - 多项式拟合 (阶 2/3/4/5)：C∞ 连续、无任何锯齿
+    #   - Bezier 曲线 (n_ctrl 4/5/6)：端点严格保持、形状可控
+    #   - 幂律模型 c(r) = a·(R−r)^p + b：经典变桨叶片工程形式
+    # 选优：AEP 损失 ≤ 容限 且 单调递减，取曲率代理最小者。
 
-from scipy.special import comb as _comb
-from scipy.optimize import least_squares as _lsq
+    from scipy.special import comb as _comb
+    from scipy.optimize import least_squares as _lsq
 
-_AEP_LOSS_ENG_TOL  = 3.0   # %, AEP 损失容忍上限（工程质量优先，可放宽）
-_AEP_LOSS_ENG_WARN = 2.0   # %, AEP 损失警告阈值
+    _AEP_LOSS_ENG_TOL  = 3.0   # %, AEP 损失容忍上限（工程质量优先，可放宽）
+    _AEP_LOSS_ENG_WARN = 2.0   # %, AEP 损失警告阈值
 
-print("\n" + "=" * 60)
-print(f"8e. 工程光滑后处理（参数化拟合，AEP 损失容限 {_AEP_LOSS_ENG_TOL:.1f}%）")
-print("=" * 60)
+    print("\n" + "=" * 60)
+    print(f"8e. 工程光滑后处理（参数化拟合，AEP 损失容限 {_AEP_LOSS_ENG_TOL:.1f}%）")
+    print("=" * 60)
 
-_r_var_e   = r[n_fix:]
-_c_base_e  = best_chord[n_fix:].copy()
-_AEP_ref_e = best_AEP
-_t_norm_e  = (_r_var_e - _r_var_e[0]) / (_r_var_e[-1] - _r_var_e[0])
-
-
-def _bezier_curve(t, ctrl):
-    """N 阶 Bezier 曲线求值，t∈[0,1]"""
-    n = len(ctrl) - 1
-    vals = np.zeros_like(t, dtype=float)
-    for i in range(n + 1):
-        vals += _comb(n, i) * (t ** i) * ((1.0 - t) ** (n - i)) * ctrl[i]
-    return vals
+    _r_var_e   = r[n_fix:]
+    _c_base_e  = best_chord[n_fix:].copy()
+    _AEP_ref_e = best_AEP
+    _t_norm_e  = (_r_var_e - _r_var_e[0]) / (_r_var_e[-1] - _r_var_e[0])
 
 
-def _fit_bezier(t_norm, c_arr, n_ctrl):
-    """端点固定的 n_ctrl 阶 Bezier 最小二乘拟合"""
-    def residual(mid):
-        ctrl = np.concatenate([[c_arr[0]], mid, [c_arr[-1]]])
-        return _bezier_curve(t_norm, ctrl) - c_arr
-    mid_init = np.linspace(c_arr[0], c_arr[-1], n_ctrl)[1:-1]
-    res = _lsq(residual, mid_init)
-    ctrl_full = np.concatenate([[c_arr[0]], res.x, [c_arr[-1]]])
-    return _bezier_curve(t_norm, ctrl_full)
+    def _bezier_curve(t, ctrl):
+        """N 阶 Bezier 曲线求值，t∈[0,1]"""
+        n = len(ctrl) - 1
+        vals = np.zeros_like(t, dtype=float)
+        for i in range(n + 1):
+            vals += _comb(n, i) * (t ** i) * ((1.0 - t) ** (n - i)) * ctrl[i]
+        return vals
 
 
-def _fit_poly(t_norm, c_arr, order):
-    """阶数为 order 的多项式最小二乘拟合（t 归一化以改善数值条件）"""
-    coef = np.polyfit(t_norm, c_arr, order)
-    return np.polyval(coef, t_norm)
+    def _fit_bezier(t_norm, c_arr, n_ctrl):
+        """端点固定的 n_ctrl 阶 Bezier 最小二乘拟合"""
+        def residual(mid):
+            ctrl = np.concatenate([[c_arr[0]], mid, [c_arr[-1]]])
+            return _bezier_curve(t_norm, ctrl) - c_arr
+        mid_init = np.linspace(c_arr[0], c_arr[-1], n_ctrl)[1:-1]
+        res = _lsq(residual, mid_init)
+        ctrl_full = np.concatenate([[c_arr[0]], res.x, [c_arr[-1]]])
+        return _bezier_curve(t_norm, ctrl_full)
 
 
-def _fit_power_law(r_arr, c_arr):
-    """c(r) = a·(R_end − r)^p + b 幂律拟合（经典叶片工程形式）"""
-    R_end = r_arr[-1] + 1e-3
-    def residual(params):
-        a, p, b = params
-        return a * (R_end - r_arr) ** p + b - c_arr
-    params_init = [max(c_arr[0] - c_arr[-1], 0.05), 1.0, c_arr[-1]]
-    bounds = ([0.0, 0.1, 0.0], [2.0, 5.0, 1.0])
-    res = _lsq(residual, params_init, bounds=bounds)
-    a, p, b = res.x
-    return a * (R_end - r_arr) ** p + b
+    def _fit_poly(t_norm, c_arr, order):
+        """阶数为 order 的多项式最小二乘拟合（t 归一化以改善数值条件）"""
+        coef = np.polyfit(t_norm, c_arr, order)
+        return np.polyval(coef, t_norm)
 
 
-# ----- 构建候选方案 -----
-_cands_e = []
+    def _fit_power_law(r_arr, c_arr):
+        """c(r) = a·(R_end − r)^p + b 幂律拟合（经典叶片工程形式）"""
+        R_end = r_arr[-1] + 1e-3
+        def residual(params):
+            a, p, b = params
+            return a * (R_end - r_arr) ** p + b - c_arr
+        params_init = [max(c_arr[0] - c_arr[-1], 0.05), 1.0, c_arr[-1]]
+        bounds = ([0.0, 0.1, 0.0], [2.0, 5.0, 1.0])
+        res = _lsq(residual, params_init, bounds=bounds)
+        a, p, b = res.x
+        return a * (R_end - r_arr) ** p + b
 
-for _ord in [2, 3, 4, 5]:
+
+    # ----- 构建候选方案 -----
+    _cands_e = []
+
+    for _ord in [2, 3, 4, 5]:
+        try:
+            _c_s = _fit_poly(_t_norm_e, _c_base_e, _ord)
+            _cands_e.append((f"poly-{_ord}", _c_s))
+        except Exception as _ex:
+            print(f"  poly-{_ord} 拟合失败: {_ex}")
+
+    for _n in [4, 5, 6]:
+        try:
+            _c_s = _fit_bezier(_t_norm_e, _c_base_e, _n)
+            _cands_e.append((f"bezier-{_n}", _c_s))
+        except Exception as _ex:
+            print(f"  bezier-{_n} 拟合失败: {_ex}")
+
     try:
-        _c_s = _fit_poly(_t_norm_e, _c_base_e, _ord)
-        _cands_e.append((f"poly-{_ord}", _c_s))
+        _c_s = _fit_power_law(_r_var_e, _c_base_e)
+        _cands_e.append(("power-law", _c_s))
     except Exception as _ex:
-        print(f"  poly-{_ord} 拟合失败: {_ex}")
+        print(f"  power-law 拟合失败: {_ex}")
 
-for _n in [4, 5, 6]:
-    try:
-        _c_s = _fit_bezier(_t_norm_e, _c_base_e, _n)
-        _cands_e.append((f"bezier-{_n}", _c_s))
-    except Exception as _ex:
-        print(f"  bezier-{_n} 拟合失败: {_ex}")
+    # ----- 评价每个候选 -----
+    print(f"\n{'方案':>10s}  {'曲率(×10⁻⁴)':>12s}  {'最大偏差(m)':>11s}  "
+          f"{'AEP(W)':>10s}  {'ΔAEP%':>8s}  {'单调':>4s}")
+    print("-" * 72)
 
-try:
-    _c_s = _fit_power_law(_r_var_e, _c_base_e)
-    _cands_e.append(("power-law", _c_s))
-except Exception as _ex:
-    print(f"  power-law 拟合失败: {_ex}")
+    _log_e = []
+    for _name, _c_s in _cands_e:
+        _c_clip = np.clip(_c_s, chord_lower[n_fix:], chord_upper[n_fix:])
+        _mono   = bool(np.all(np.diff(_c_clip) <= 1e-8))
+        _cf     = best_chord.copy()
+        _cf[n_fix:] = _c_clip
+        _aep_i, _prob_i = _eval_aep_only(_cf)
+        _loss_i = (_AEP_ref_e - _aep_i) / _AEP_ref_e * 100.0
+        _curv_i = _second_diff_cost(_c_clip)
+        _mdev_i = float(np.max(np.abs(_c_clip - _c_base_e)))
+        _log_e.append({
+            "name": _name, "chord": _c_clip, "AEP": _aep_i,
+            "loss_pct": _loss_i, "curvature": _curv_i,
+            "mono": _mono, "max_dev": _mdev_i, "prob": _prob_i,
+        })
+        print(f"  {_name:>8s}  {_curv_i * 1e4:12.6f}  {_mdev_i:11.5f}  "
+              f"{_aep_i:10.1f}  {_loss_i:+8.3f}%  {'✓' if _mono else '✗'}")
 
-# ----- 评价每个候选 -----
-print(f"\n{'方案':>10s}  {'曲率(×10⁻⁴)':>12s}  {'最大偏差(m)':>11s}  "
-      f"{'AEP(W)':>10s}  {'ΔAEP%':>8s}  {'单调':>4s}")
-print("-" * 72)
+    # ----- 选优：AEP 损失在容限内且单调递减，取曲率最小 -----
+    _valid_e = [lg for lg in _log_e
+                if lg["loss_pct"] <= _AEP_LOSS_ENG_TOL and lg["mono"]]
 
-_log_e = []
-for _name, _c_s in _cands_e:
-    _c_clip = np.clip(_c_s, chord_lower[n_fix:], chord_upper[n_fix:])
-    _mono   = bool(np.all(np.diff(_c_clip) <= 1e-8))
-    _cf     = best_chord.copy()
-    _cf[n_fix:] = _c_clip
-    _aep_i, _prob_i = _eval_aep_only(_cf)
-    _loss_i = (_AEP_ref_e - _aep_i) / _AEP_ref_e * 100.0
-    _curv_i = _second_diff_cost(_c_clip)
-    _mdev_i = float(np.max(np.abs(_c_clip - _c_base_e)))
-    _log_e.append({
-        "name": _name, "chord": _c_clip, "AEP": _aep_i,
-        "loss_pct": _loss_i, "curvature": _curv_i,
-        "mono": _mono, "max_dev": _mdev_i, "prob": _prob_i,
-    })
-    print(f"  {_name:>8s}  {_curv_i * 1e4:12.6f}  {_mdev_i:11.5f}  "
-          f"{_aep_i:10.1f}  {_loss_i:+8.3f}%  {'✓' if _mono else '✗'}")
+    if not _valid_e:
+        print(f"\n[工程光滑] 无候选满足 (AEP 损失 ≤ {_AEP_LOSS_ENG_TOL:.1f}% 且单调递减)，"
+              f"保留 8d 结果。")
+    else:
+        _best_e = min(_valid_e, key=lambda lg: lg["curvature"])
+        _curv_b = _second_diff_cost(_c_base_e)
+        _impv_e = ((1.0 - _best_e["curvature"] / _curv_b) * 100.0
+                   if _curv_b > 0 else 0.0)
 
-# ----- 选优：AEP 损失在容限内且单调递减，取曲率最小 -----
-_valid_e = [lg for lg in _log_e
-            if lg["loss_pct"] <= _AEP_LOSS_ENG_TOL and lg["mono"]]
+        print(f"\n[工程光滑] 最优方案: {_best_e['name']}")
+        print(f"  曲率 (×10⁻⁴)       : {_curv_b * 1e4:.6f} → "
+              f"{_best_e['curvature'] * 1e4:.6f}  (改善 {_impv_e:.1f}%)")
+        print(f"  最大弦长偏差       : {_best_e['max_dev']:.5f} m")
+        print(f"  AEP 损失           : {_best_e['loss_pct']:+.3f}%")
+        if _best_e["loss_pct"] > _AEP_LOSS_ENG_WARN:
+            print(f"  ⚠ AEP 损失 > {_AEP_LOSS_ENG_WARN:.1f}%，请工程师确认是否接受。")
 
-if not _valid_e:
-    print(f"\n[工程光滑] 无候选满足 (AEP 损失 ≤ {_AEP_LOSS_ENG_TOL:.1f}% 且单调递减)，"
-          f"保留 8d 结果。")
-else:
-    _best_e = min(_valid_e, key=lambda lg: lg["curvature"])
-    _curv_b = _second_diff_cost(_c_base_e)
-    _impv_e = ((1.0 - _best_e["curvature"] / _curv_b) * 100.0
-               if _curv_b > 0 else 0.0)
+        print(f"\n  {'r(m)':>6s}  {'优化弦长':>10s}  {'工程光滑':>10s}  {'Δchord':>8s}")
+        for _rj, _cob, _cse in zip(r[n_fix:], _c_base_e, _best_e["chord"]):
+            print(f"  {_rj:6.3f}  {_cob:10.4f}  {_cse:10.4f}  {_cse - _cob:+8.4f}")
 
-    print(f"\n[工程光滑] 最优方案: {_best_e['name']}")
-    print(f"  曲率 (×10⁻⁴)       : {_curv_b * 1e4:.6f} → "
-          f"{_best_e['curvature'] * 1e4:.6f}  (改善 {_impv_e:.1f}%)")
-    print(f"  最大弦长偏差       : {_best_e['max_dev']:.5f} m")
-    print(f"  AEP 损失           : {_best_e['loss_pct']:+.3f}%")
-    if _best_e["loss_pct"] > _AEP_LOSS_ENG_WARN:
-        print(f"  ⚠ AEP 损失 > {_AEP_LOSS_ENG_WARN:.1f}%，请工程师确认是否接受。")
-
-    print(f"\n  {'r(m)':>6s}  {'优化弦长':>10s}  {'工程光滑':>10s}  {'Δchord':>8s}")
-    for _rj, _cob, _cse in zip(r[n_fix:], _c_base_e, _best_e["chord"]):
-        print(f"  {_rj:6.3f}  {_cob:10.4f}  {_cse:10.4f}  {_cse - _cob:+8.4f}")
-
-    _chord_eng = best_chord.copy()
-    _chord_eng[n_fix:] = _best_e["chord"]
-    best_chord = _chord_eng
-    best_AEP   = _best_e["AEP"]
-    best_prob  = _best_e["prob"]
-    print(f"\n  → 已采用工程光滑结果（制造/结构友好，工程质量优先）")
+        _chord_eng = best_chord.copy()
+        _chord_eng[n_fix:] = _best_e["chord"]
+        best_chord = _chord_eng
+        best_AEP   = _best_e["AEP"]
+        best_prob  = _best_e["prob"]
+        print(f"\n  → 已采用工程光滑结果（制造/结构友好，工程质量优先）")
 
 
 # ================================================================

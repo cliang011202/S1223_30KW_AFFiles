@@ -19,6 +19,9 @@ __pycache__/
 .vscode/
 .idea/
 
+# Reference (large PDF/textbook files, not for git)
+Reference/
+
 # CAD/Solidworks
 
 # 构建产物
